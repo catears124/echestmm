@@ -24,9 +24,10 @@ final class PacingAndLadderTest {
     @Test
     void theCeilingStaysInsideTheSafeBand() {
         assertEquals(0.40, ActionPacer.clamp(0.01), 1e-9);
-        assertEquals(1.30, ActionPacer.clamp(9.0), 1e-9);
-        assertEquals(0.90, ActionPacer.clamp(Double.NaN), 1e-9);
-        // The observed kick threshold must sit above whatever the pacer can ever allow.
+        assertEquals(1.60, ActionPacer.clamp(9.0), 1e-9);
+        assertEquals(1.20, ActionPacer.clamp(Double.NaN), 1e-9);
+        // The slowest rate ever observed to earn a kick was 2.0/s sustained. The ceiling must stay
+        // clear of it even after every recovery interval the pacer can ever earn.
         assertTrue(ActionPacer.clamp(9.0) < 2.0);
     }
 

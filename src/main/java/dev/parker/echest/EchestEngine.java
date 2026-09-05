@@ -76,6 +76,16 @@ public final class EchestEngine {
     private static final int MARKET_RECHECK_TICKS = 600;
     private static final int OWN_REREAD_EVERY = 25;
     private static final int BALANCE_REFRESH_TICKS = 2400;
+
+    /** How long a posted order stands before the book is re-planned. */
+    private static final long ORDER_REPLAN_MS = 60_000L;
+    /** Acquire through buy orders rather than clicks. */
+    private static boolean ordering = true;
+    /** Modelled profit an order sweep must clear before it is worth posting. */
+    private static long minOrderProfit = 25_000L;
+    private static long lastOrderMs;
+    private static Sweep.Plan lastSweep = Sweep.Plan.no("not evaluated");
+
     /** An open auction page younger than this is reused instead of re-searched. */
     private static final long PAGE_FRESH_MS = 1_500L;
     /** Weight charged for one inventory shuffling click; three of them cost one interaction. */
@@ -352,7 +362,6 @@ public final class EchestEngine {
     }
 
     // ---- commands --------------------------------------------------------------------------
-
     private static void registerCommands() {
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
                 dispatcher.register(literal("echestmm")
@@ -414,6 +423,19 @@ public final class EchestEngine {
                                 feedback(ctx.getSource()::sendFeedback, OrderFlow.collect(itemId))))
                         .then(literal("orderstatus").executes(ctx ->
                                 feedback(ctx.getSource()::sendFeedback, OrderFlow.step() + ": " + OrderFlow.note())))
+                        .then(literal("ordering").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
+                            ordering = BoolArgumentType.getBool(ctx, "on");
+                            return feedback(ctx.getSource()::sendFeedback,
+                                    "acquire through buy orders " + (ordering ? "ON" : "OFF"));
+                        })))
+                        .then(literal("orderprofit").then(argument("dollars", IntegerArgumentType.integer(0))
+                                .executes(ctx -> {
+                                    minOrderProfit = IntegerArgumentType.getInteger(ctx, "dollars");
+                                    return feedback(ctx.getSource()::sendFeedback,
+                                            "an order sweep must model $" + minOrderProfit + " profit");
+                                })))
+                        .then(literal("sweep").executes(ctx ->
+                                feedback(ctx.getSource()::sendFeedback, lastSweep.reason())))
                         .then(literal("snipe").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
                             sniping = BoolArgumentType.getBool(ctx, "on");
                             return feedback(ctx.getSource()::sendFeedback, "sniping " + (sniping ? "ON" : "OFF"));
@@ -568,6 +590,7 @@ public final class EchestEngine {
         return "state=" + state + (state == State.PAUSED ? " (" + pauseReason + ")" : "")
                 + " | " + itemId + " x" + unitSize
                 + " | ask=" + (lastQuote == null ? "n/a" : lastQuote.unitPrice() + "/item")
+                + " | regime=" + Liquidity.classify(competingLevels())
                 + " | clear=" + (Double.isFinite(clearRate) ? String.format(Locale.ROOT, "%.3f/s", clearRate) : "unmeasured")
                 + " (" + fills.size() + " fills)"
                 + " | free=" + localFree
@@ -1375,6 +1398,30 @@ public final class EchestEngine {
         Liquidity.Quote quote = quoteNow();
         lastQuote = quote;
         long floor = levels.getFirst().unitPrice();
+
+        // Acquisition by order, which supersedes clicking when it is available: one posted order
+        // fills cheapest-first across the whole tail, where the click path spent an action per
+        // listing and lost most of those races anyway. The pacer ceiling is fixed, so the way to
+        // deploy more capital per minute is to spend fewer actions doing it.
+        if (ordering && !OrderFlow.busy()) {
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - lastOrderMs >= ORDER_REPLAN_MS) {
+                int heldUnits = countInventory(Minecraft.getInstance());
+                int roomUnits = maxHoldUnits > 0
+                        ? Math.max(0, maxHoldUnits * Math.max(1, unitSize) - heldUnits)
+                        : Integer.MAX_VALUE;
+                Sweep.Plan sweep = Sweep.plan(levels, quote.unitPrice(), cash, roomUnits,
+                        minOrderProfit, cfg);
+                lastSweep = sweep;
+                if (sweep.go()) {
+                    lastOrderMs = nowMs;
+                    buyReason = "order sweep: " + sweep.reason();
+                    trace(buyReason);
+                    OrderFlow.place(itemId, deskItemName(), sweep.units(), sweep.ceilingPrice());
+                    return false;   // the order flow owns the GUI until it finishes
+                }
+            }
+        }
 
         long ladderAt = 0;
         if (acquiring) {

@@ -34,13 +34,19 @@ public final class ActionPacer {
      * Actions per second the pacer starts at on a fresh install.
      *
      * <p>The kicked session averaged 0.85 actions/s overall but burst to 2.0-2.2/s for tens of
-     * seconds at a time, and every kick followed such a burst. A flat ceiling under 1.0 removes
-     * the bursts entirely; the throughput lost is roughly what the price-grid fix gives back, since
-     * 29% of that session's actions were re-reads caused by listings never matching their receipts.
+     * seconds at a time, and every kick followed such a burst. What gets you kicked is the burst,
+     * not the average, and the bucket below is what removes bursts - so the sustained ceiling can
+     * sit higher than the first cautious guess without going anywhere near the observed threshold.
+     *
+     * <p>1.20/s sustained is 45% under the slowest rate ever seen to earn a kick, and the ratchet
+     * still drops to 0.25/s the instant one arrives. The honest caveat: the kick threshold was
+     * measured on bursty traffic, so a sustained rate this high has not been proven safe - it is
+     * an inference from where the bursts were. If penalties start appearing in {@code /echestmm
+     * pace}, this number is why, and it is one constant to lower.
      */
-    private static final double DEFAULT_CAP = 0.90;
+    private static final double DEFAULT_CAP = 1.20;
     private static final double MIN_CAP = 0.40;
-    private static final double MAX_CAP = 1.30;
+    private static final double MAX_CAP = 1.60;
     /** Hard drop applied the moment a kick or a rate-limit line is seen. */
     private static final double PENALTY = 0.25;
     /** Earned back per clean interval, so recovery takes tens of minutes, not seconds. */

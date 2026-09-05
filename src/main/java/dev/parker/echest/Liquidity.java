@@ -129,6 +129,34 @@ public final class Liquidity {
     }
 
     /**
+     * How much company we have on the sell side, which is what decides the pricing tactic.
+     *
+     * <p>These are not three shades of the same behaviour, they are three different trades:
+     * <ul>
+     *   <li>{@link #OPEN} - nobody else is selling. There is no competitive price, only a
+     *       willingness-to-pay we have not measured yet, so the ask ratchets upward until fills
+     *       slow down. Undercutting a floor that does not exist is how the desk gave away $30k+
+     *       per ender chest.</li>
+     *   <li>{@link #THIN} - a handful of listings stand between us and the top. Buying them is
+     *       usually cheaper than pricing under them: the cost is bounded, and afterwards we
+     *       <em>are</em> the floor and can list where they used to be.</li>
+     *   <li>{@link #CROWDED} - too many competitors to buy out. Undercut and turn inventory,
+     *       because revenue rate beats price per unit when the queue is long.</li>
+     * </ul>
+     */
+    public enum Regime { OPEN, THIN, CROWDED }
+
+    /** Competing listings at or above which a book is too deep to buy out. */
+    public static final int THIN_BOOK_LISTINGS = 6;
+
+    public static Regime classify(List<Level> levels) {
+        int listings = 0;
+        for (Level l : sortedCompeting(levels)) listings += Math.max(0, l.listings);
+        if (listings == 0) return Regime.OPEN;
+        return listings < THIN_BOOK_LISTINGS ? Regime.THIN : Regime.CROWDED;
+    }
+
+    /**
      * The unit price to list at right now.
      *
      * <p>Candidates are one tick under every competing level, plus one probe above the top of the
@@ -187,9 +215,28 @@ public final class Liquidity {
             bestWithinHold = withinHold;
         }
 
+        // Never undercut our own resting asks. Pricing under ourselves does not win the sale from
+        // a competitor - it wins it from us, at a discount we chose to hand over. When the book
+        // falls below where we already rest, the right move is to join our own level, not dive
+        // under it. (Cutting our own price is a decision for the ladder, not for a quote.)
+        long ownFloor = Long.MAX_VALUE;
+        if (ownUnitPrices != null) {
+            for (Long own : ownUnitPrices) {
+                if (own != null && own > 0) ownFloor = Math.min(ownFloor, own);
+            }
+        }
+        String selfNote = "";
+        if (ownFloor != Long.MAX_VALUE && bestPrice < ownFloor) {
+            bestPrice = ownFloor;
+            bestQueue = queueAhead(book, ownUnitPrices, bestPrice);
+            bestWait = (bestQueue + 1) / clearRate;
+            selfNote = "; held at our own " + ownFloor + " rather than undercutting ourselves";
+        }
+
         String reason = "queue " + bestQueue + " ahead, ~" + Math.round(bestWait) + "s to fill at "
                 + String.format("%.3f", clearRate) + " units/s"
-                + (bestWithinHold ? "" : "; nothing fits the hold budget, taking the best available");
+                + (bestWithinHold ? "" : "; nothing fits the hold budget, taking the best available")
+                + selfNote;
         return new Quote(bestPrice, bestQueue, bestWait, bestScore * 3_600.0, reason);
     }
 
