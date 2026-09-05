@@ -89,6 +89,10 @@ public final class EchestEngine {
     /** Ticks allowed for a disconnect to reveal itself as involuntary. */
     private static final long DISCONNECT_CLASSIFY_TICKS = 60L;
 
+    /** Discovery may probe up to this multiple of the realised-price anchor, never past it. */
+    private static final long ASK_DISCOVERY_MAX_MULTIPLE = 8L;
+    /** How often a squeeze is re-planned, and how long one plan stays in force. */
+    private static final long SQUEEZE_REPLAN_MS = 30_000L;
     enum State {
         OFF, PAUSED,
         CHECK_OWN, WAIT_OWN_AH, WAIT_OWN_SCAN,
@@ -154,6 +158,12 @@ public final class EchestEngine {
     private static long buyMaxPay;
     private static String buyReason = "";
     private static long buyBudgetRemaining;
+    private static long discoveredAsk;
+    private static long lastFillAtMs;
+    private static Campaign.Plan squeeze;
+    private static long squeezeUntilMs;
+    private static long lastSqueezePlanMs;
+    private static boolean squeezing = false;
 
     private static final TreeMap<Long, Integer> marketUnits = new TreeMap<>();
     private static long currentUnitPrice;
@@ -325,6 +335,12 @@ public final class EchestEngine {
                             selling = BoolArgumentType.getBool(ctx, "on");
                             return feedback(ctx.getSource()::sendFeedback, "sell side " + (selling ? "ON" : "OFF"));
                         })))
+                        .then(literal("squeeze").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
+                            squeezing = BoolArgumentType.getBool(ctx, "on");
+                            squeeze = null;
+                            squeezeUntilMs = 0L;
+                            return feedback(ctx.getSource()::sendFeedback, "squeeze " + (squeezing ? "ON" : "OFF"));
+                        })))
                         .then(literal("acquire").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
                             acquiring = BoolArgumentType.getBool(ctx, "on");
                             currentBid = 0;
@@ -405,15 +421,17 @@ public final class EchestEngine {
                 sniping = true;
                 lifting = true;
                 acquiring = false;   // chests are crafted, not bought
+                squeezing = false;   // one at a time; there is nothing to squeeze with
             }
             case "obsidian", "obby" -> {
                 itemId = "minecraft:obsidian";
                 searchTerm = "obsidian";
                 unitSize = 64;
                 selling = true;
-                sniping = false;     // the ladder is the buy side here, not opportunistic snipes
-                lifting = true;
-                acquiring = true;
+                sniping = false;     // the squeeze owns the buy side here
+                lifting = false;     // superseded by the squeeze, which posts before it sweeps
+                acquiring = false;
+                squeezing = true;
             }
             default -> {
                 return "unknown desk \"" + name + "\"; use echest or obsidian";
@@ -488,6 +506,9 @@ public final class EchestEngine {
                 + " | listed=" + listed + " sold=" + sold + " ($" + grossSold + ")"
                 + " | bought=" + bought + " ($" + grossBought + ")"
                 + (acquiring ? " | bid=" + currentBid + " acquired=" + acquired + " ($" + acquiredCost + ")" : "")
+                + (squeezing ? " | squeeze=" + (squeeze != null && squeeze.go()
+                        ? squeeze.askUnitPrice() + "/item sweeping <=" + squeeze.sweepCeiling() + "/item"
+                        : "waiting: " + (squeeze == null ? "not planned yet" : squeeze.reason())) : "")
                 + " | cash=" + (cash < 0 ? "unknown" : "$" + cash)
                 + " | pace=" + String.format(Locale.ROOT, "%.2f/s", ActionPacer.cap())
                 + " | levels from " + (lastCalibration == null ? "defaults (not calibrated)"
@@ -661,6 +682,7 @@ public final class EchestEngine {
         fills.add(new Liquidity.Fill(match.queueAhead, holdSeconds));
         if (fills.size() > 200) fills.removeFirst();
         clearRate = Liquidity.clearRate(fills);
+        lastFillAtMs = soldAtMs > 0 ? soldAtMs : System.currentTimeMillis();
         trace("filled " + price + " after " + Math.round(holdSeconds) + "s from queue " + match.queueAhead
                 + "; clearing rate " + String.format(Locale.ROOT, "%.3f", clearRate) + " units/s");
     }
@@ -708,14 +730,62 @@ public final class EchestEngine {
     }
 
     private static boolean needBalance() {
-        return (sniping || lifting || acquiring) && (cash < 0 || ticks - lastBalanceTick >= BALANCE_REFRESH_TICKS);
+        return (sniping || lifting || acquiring || squeezing)
+                && (cash < 0 || ticks - lastBalanceTick >= BALANCE_REFRESH_TICKS);
     }
 
+    /**
+     * Re-plans the squeeze from the current book, inventory, slots, cash and clearing rate.
+     * Cheap - it is pure arithmetic over the cached book - so it runs on every dispatch.
+     */
+    private static void planSqueeze(long nowMs) {
+        if (!squeezing) { squeeze = null; return; }
+        if (squeeze != null && squeeze.go() && nowMs < squeezeUntilMs) return;
+        if (nowMs - lastSqueezePlanMs < 1_000L) return;
+        lastSqueezePlanMs = nowMs;
+        int held = countInventory(Minecraft.getInstance());
+        long costPer = acquired > 0 ? acquiredCost / Math.max(1, acquired * Math.max(1, unitSize))
+                : cfg.minPrice();
+        Campaign.Plan plan = Campaign.plan(competingLevels(), held, costPer, Math.max(0, localFree),
+                unitSize, cash, clearRate, sanityMaxAsk(), cfg);
+        if (plan.go() && (squeeze == null || !squeeze.go() || plan.askUnitPrice() != squeeze.askUnitPrice())) {
+            trace("squeeze: " + plan.reason());
+        } else if (!plan.go() && squeeze != null && squeeze.go()) {
+            trace("squeeze off: " + plan.reason());
+        }
+        squeeze = plan;
+        squeezeUntilMs = plan.go() ? nowMs + SQUEEZE_REPLAN_MS : 0L;
+    }
+
+    /**
+     * The single dispatcher. Under a squeeze the order is deliberate: post the asks first, then
+     * clear everything under them. Sweeping first would just hand cheap supply to whoever is
+     * still undercutting us.
+     */
     private static void next(String why) {
-        if (needOwnRead()) setState(State.CHECK_OWN, why + "; need your-listings read");
-        else if (needMarketRead()) setState(State.CHECK_MARKET, why + "; need market read");
-        else if (planBuy()) setState(State.BUY_OPEN, why + "; " + buyReason);
-        else if (!selling) setState(State.WAIT_FULL, why + "; sell side off");
+        long nowMs = System.currentTimeMillis();
+        if (needOwnRead()) { setState(State.CHECK_OWN, why + "; need your-listings read"); return; }
+        if (needMarketRead()) { setState(State.CHECK_MARKET, why + "; need market read"); return; }
+
+        planSqueeze(nowMs);
+        if (squeeze != null && squeeze.go()) {
+            boolean postedEnough = ownTotal() > 0 && ownPriceCounts.containsKey(squeeze.askUnitPrice());
+            boolean stockLeft = countInventory(Minecraft.getInstance()) >= unitSize;
+            if (selling && stockLeft && localFree > 0 && !postedEnough) {
+                setState(State.PREPARE_SELL, why + "; posting squeeze asks at " + squeeze.askUnitPrice());
+                return;
+            }
+            if (planBuy()) { setState(State.BUY_OPEN, why + "; " + buyReason); return; }
+            if (selling && stockLeft && localFree > 0) {
+                setState(State.PREPARE_SELL, why + "; topping up squeeze asks");
+                return;
+            }
+        } else if (planBuy()) {
+            setState(State.BUY_OPEN, why + "; " + buyReason);
+            return;
+        }
+
+        if (!selling) setState(State.WAIT_FULL, why + "; sell side off");
         else if (localFree == 0) enterFull(why);
         else setState(State.PREPARE_SELL, why);
     }
@@ -779,12 +849,12 @@ public final class EchestEngine {
                 }
             }
             case CHECK_MARKET -> {
-                // An open, fresh page is free market data; do not spend a command on it.
+                // An open search page is free market data. It has to be a *search* page, though:
+                // the /ah main menu is also titled "Auction House | Page 1", and reusing it read
+                // the book as empty, which silently disabled every price decision downstream.
                 MarketFeed.PageScan open = MarketFeed.latestPage();
-                if (open != null && nowMs - open.observedAtMs() <= PAGE_FRESH_MS && open.page() == 1
-                        && screen instanceof AbstractContainerScreen<?>
-                        && MarketFeed.isAuctionPage(screen.getTitle().getString())) {
-                    if (readMarket(player, open)) { retries = 0; next("reused the open market page"); }
+                if (isUsableBookPage(open, nowMs, screen)) {
+                    if (readMarket(player, open)) { retries = 0; next("reused the open search page"); }
                     return;
                 }
                 if (!readyForCommand(player, inv, screen)) return;
@@ -810,11 +880,7 @@ public final class EchestEngine {
             }
             case BUY_OPEN -> {
                 MarketFeed.PageScan open = MarketFeed.latestPage();
-                boolean pageUsable = open != null && open.page() == 1
-                        && nowMs - open.observedAtMs() <= PAGE_FRESH_MS
-                        && screen instanceof AbstractContainerScreen<?>
-                        && MarketFeed.isAuctionPage(screen.getTitle().getString());
-                if (pageUsable) {
+                if (isUsableBookPage(open, nowMs, screen)) {
                     // The live page keeps updating from inbound packets: no command, no cooldown,
                     // and prices stay current between clicks.
                     requestMs = open.observedAtMs();
@@ -1090,9 +1156,28 @@ public final class EchestEngine {
     }
 
     /**
-     * Caches the book as unit prices. Every stack size counts: a 16x listing at 5,000 is cheaper
-     * per item than a 64x at 25,000, and ignoring it is what made the obsidian book read as empty.
+     * True when a page scan really is our item's search results and is fresh enough to act on.
+     *
+     * <p>Three checks, each earned: page 1 and fresh, an open container screen, and - the one that
+     * was missing - evidence that this is the search rather than the auction house lobby. The
+     * lobby carries the same "Auction House | Page 1" title and holds no listings, so accepting it
+     * made every book read return zero and every price fall back to the empty-book branch.
      */
+    private static boolean isUsableBookPage(MarketFeed.PageScan page, long nowMs, Screen screen) {
+        if (page == null || page.page() != 1) return false;
+        if (nowMs - page.observedAtMs() > PAGE_FRESH_MS) return false;
+        if (!(screen instanceof AbstractContainerScreen<?>)) return false;
+        if (!MarketFeed.isAuctionPage(screen.getTitle().getString())) return false;
+        String search = page.search() == null ? "" : page.search().toLowerCase(Locale.ROOT);
+        String want = searchTerm.toLowerCase(Locale.ROOT);
+        if (!search.isBlank() && (search.contains(want) || want.contains(search))) return true;
+        // Some layouts do not echo the search into the title; a page holding our item proves it.
+        for (MarketFeed.Listing l : page.listings()) {
+            if (itemId.equals(l.itemId())) return true;
+        }
+        return false;
+    }
+
     private static boolean readMarket(LocalPlayer player, MarketFeed.PageScan page) {
         List<MarketFeed.Listing> all = page.listings();
         if (all.size() >= 4) {
@@ -1134,8 +1219,54 @@ public final class EchestEngine {
         return levels;
     }
 
+    /**
+     * The unit price the next listing goes out at.
+     *
+     * <p>Three regimes, in priority order: an active squeeze posts at its chosen level; an empty
+     * or wholly-owned book is a price-discovery problem and probes upward; otherwise the revenue
+     * rate model prices against the visible competition.
+     */
     private static Liquidity.Quote quoteNow() {
-        return Liquidity.quote(competingLevels(), new ArrayList<>(ownPriceCounts.keySet()), clearRate, cfg);
+        List<Liquidity.Level> levels = competingLevels();
+        if (squeeze != null && squeeze.go() && squeezeUntilMs > System.currentTimeMillis()) {
+            return new Liquidity.Quote(squeeze.askUnitPrice(),
+                    Liquidity.queueAhead(levels, new ArrayList<>(ownPriceCounts.keySet()),
+                            squeeze.askUnitPrice()),
+                    Double.NaN, Double.NaN, "squeeze: " + squeeze.reason());
+        }
+        if (levels.isEmpty()) {
+            long opening = Math.max(cfg.minPrice(), cfg.fallbackPrice());
+            discoveredAsk = Liquidity.discoveryAsk(discoveredAsk, medianRecentHoldSeconds(),
+                    secondsSinceFill(), opening, sanityMaxAsk(), cfg);
+            return new Liquidity.Quote(discoveredAsk, 0, Double.NaN, Double.NaN,
+                    "nobody else is selling: probing upward, "
+                            + (Double.isFinite(medianRecentHoldSeconds())
+                                ? "recent fills in ~" + Math.round(medianRecentHoldSeconds()) + "s"
+                                : "no fills yet"));
+        }
+        discoveredAsk = 0;   // a real book is in front of us again; discovery restarts from it
+        return Liquidity.quote(levels, new ArrayList<>(ownPriceCounts.keySet()), clearRate, cfg);
+    }
+
+    /** Median hold time of the last few fills; the underpricing signal. */
+    private static double medianRecentHoldSeconds() {
+        if (fills.isEmpty()) return Double.NaN;
+        int from = Math.max(0, fills.size() - 5);
+        List<Double> holds = new ArrayList<>();
+        for (int i = from; i < fills.size(); i++) holds.add(fills.get(i).holdSeconds());
+        holds.sort(null);
+        return holds.get(holds.size() / 2);
+    }
+
+    private static double secondsSinceFill() {
+        if (lastFillAtMs <= 0L) return -1.0;
+        return (System.currentTimeMillis() - lastFillAtMs) / 1000.0;
+    }
+
+    /** Discovery may probe well past realised prices, but not without limit. */
+    private static long sanityMaxAsk() {
+        long anchor = Math.max(cfg.fallbackPrice(), cfg.minPrice());
+        return anchor * ASK_DISCOVERY_MAX_MULTIPLE;
     }
 
     /** Our own resting ask per item, which is what a bid has to stay clear of. */
@@ -1197,13 +1328,18 @@ public final class EchestEngine {
             if (plan.go()) liftAt = plan.buyUpTo();
         }
 
-        long ceiling = Math.max(ladderAt, Math.max(snipeAt, liftAt));
+        // A live squeeze takes everything under its ask; that is the point of it.
+        long squeezeAt = squeeze != null && squeeze.go() ? squeeze.sweepCeiling() : 0;
+        long ceiling = Math.max(squeezeAt, Math.max(ladderAt, Math.max(snipeAt, liftAt)));
         if (ceiling <= 0 || floor > ceiling) return false;
 
         buyMaxPay = ceiling;   // unit price
         buyBudgetRemaining = (long) Math.floor(cash * cfg.maxCashSharePct());
         if (buyBudgetRemaining < floor) return false;
-        if (ceiling == ladderAt && ladderAt >= snipeAt && ladderAt >= liftAt) {
+        if (ceiling == squeezeAt) {
+            buyReason = "squeeze sweep: taking everything at or under " + squeezeAt + "/item to lift "
+                    + "the floor to our " + squeeze.askUnitPrice() + "/item asks";
+        } else if (ceiling == ladderAt && ladderAt >= snipeAt && ladderAt >= liftAt) {
             buyReason = "ladder bid " + ladderAt + "/item vs floor " + floor + "/item (ask "
                     + askInForce() + "/item)";
         } else if (liftAt >= snipeAt) {

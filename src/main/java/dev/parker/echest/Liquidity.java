@@ -198,6 +198,46 @@ public final class Liquidity {
         if (quoteUnitPrice <= 0) return 0;
         return quantize((long) Math.floor(quoteUnitPrice * (1.0 - cfg.snipeMarginPct)), cfg.tick);
     }
+    /** How quickly a fill has to arrive before the ask is treated as too low. */
+    private static final double FAST_FILL_SECONDS = 6.0;
+    /** How long the book has to ignore us before the ask comes back down. */
+    private static final double STALE_ASK_SECONDS = 90.0;
+    private static final double RAISE_FACTOR = 1.12;
+    private static final double LOWER_FACTOR = 0.94;
+
+    /**
+     * Price discovery for the case where nobody else is selling, or where we are the whole top of
+     * the book. Undercutting cannot answer "what is this worth?" - only probing can.
+     *
+     * <p>The signal is hold time, which is already measured per fill. A listing that clears in two
+     * seconds was underpriced, so the ask ratchets up 12%; if it clears in two seconds again it
+     * ratchets again, compounding until the market stops taking it. Silence for
+     * {@link #STALE_ASK_SECONDS} walks it back down 6%. Ender chests filling instantly at 6,800
+     * are exactly this situation: past sales say 6,800 because that is all we ever asked.
+     *
+     * @param current           ask in force, or 0 to start from {@code opening}
+     * @param medianHoldSeconds median hold time of recent fills, or NaN when unmeasured
+     * @param secondsSinceFill  time since the last fill, or a negative number when none yet
+     * @param opening           where to start when there is no ask yet, from realised prices
+     * @param sanityMax         hard ceiling, so a run of fast fills cannot post an absurd ask
+     */
+    public static long discoveryAsk(long current, double medianHoldSeconds, double secondsSinceFill,
+                                    long opening, long sanityMax, Config cfg) {
+        long tick = Math.max(1, cfg.tick);
+        long floor = Math.max(tick, cfg.minPrice);
+        long cap = Math.max(floor, sanityMax);
+        long ask = current > 0 ? current : Math.max(floor, opening);
+
+        if (Double.isFinite(medianHoldSeconds) && medianHoldSeconds >= 0.0
+                && medianHoldSeconds <= FAST_FILL_SECONDS) {
+            long raised = quantize(Math.round(ask * RAISE_FACTOR), tick);
+            ask = Math.max(raised, ask + tick);          // always move at least one tick
+        } else if (secondsSinceFill >= STALE_ASK_SECONDS) {
+            long lowered = quantize(Math.round(ask * LOWER_FACTOR), tick);
+            ask = Math.min(lowered, ask - tick);
+        }
+        return Math.max(floor, Math.min(cap, quantize(ask, tick)));
+    }
 
     /**
      * Two-sided market making on a thin but liquid book: rest an ask high, then walk a bid up from
