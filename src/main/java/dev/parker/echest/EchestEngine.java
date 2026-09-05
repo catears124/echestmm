@@ -257,6 +257,11 @@ public final class EchestEngine {
         // These two run even when the engine is off: the panic key has to be able to switch it on,
         // and a disconnect has to be classified after the fact.
         ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::pollPanicKey);
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            if (OrderFlow.busy() && client.player != null) {
+                OrderFlow.tick(client, System.currentTimeMillis());
+            }
+        });
         ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::checkDisconnectCause);
         MarketFeed.onReceipt(EchestEngine::onReceipt);
         MarketFeed.onMessage(EchestEngine::onMessage);
@@ -292,6 +297,18 @@ public final class EchestEngine {
             disconnectCheckUntilTick = 0;
             MarketFeed.log("pacer", "disconnect looked deliberate (no disconnect screen); ceiling unchanged");
         }
+    }
+
+    /** The item's display name as the order dialogs spell it: "minecraft:obsidian" -> "Obsidian". */
+    private static String deskItemName() {
+        String path = itemId.substring(itemId.indexOf(':') + 1);
+        StringBuilder b = new StringBuilder(path.length());
+        for (String word : path.split("_")) {
+            if (word.isEmpty()) continue;
+            if (!b.isEmpty()) b.append(' ');
+            b.append(Character.toUpperCase(word.charAt(0))).append(word.substring(1));
+        }
+        return b.toString();
     }
 
     // ---- commands --------------------------------------------------------------------------
@@ -346,6 +363,17 @@ public final class EchestEngine {
                             currentBid = 0;
                             return feedback(ctx.getSource()::sendFeedback, "bid ladder " + (acquiring ? "ON" : "OFF"));
                         })))
+                        .then(literal("order")
+                                .then(argument("amount", IntegerArgumentType.integer(1))
+                                        .then(argument("priceperitem", IntegerArgumentType.integer(1))
+                                                .executes(ctx -> feedback(ctx.getSource()::sendFeedback,
+                                                        OrderFlow.place(itemId, deskItemName(),
+                                                                IntegerArgumentType.getInteger(ctx, "amount"),
+                                                                IntegerArgumentType.getInteger(ctx, "priceperitem")))))))
+                        .then(literal("collect").executes(ctx ->
+                                feedback(ctx.getSource()::sendFeedback, OrderFlow.collect(itemId))))
+                        .then(literal("orderstatus").executes(ctx ->
+                                feedback(ctx.getSource()::sendFeedback, OrderFlow.step() + ": " + OrderFlow.note())))
                         .then(literal("snipe").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
                             sniping = BoolArgumentType.getBool(ctx, "on");
                             return feedback(ctx.getSource()::sendFeedback, "sniping " + (sniping ? "ON" : "OFF"));
@@ -606,6 +634,8 @@ public final class EchestEngine {
     }
 
     private static void onMessage(MarketFeed.MarketMessage m) {
+        // The order flow runs independently of the engine's own on/off state.
+        OrderFlow.noteChat(m.raw());
         if (state == State.OFF) return;
         switch (m.kind()) {
             case "RATE_LIMIT" -> ActionPacer.penalize(System.currentTimeMillis(), "server rate-limit line");
@@ -806,6 +836,12 @@ public final class EchestEngine {
         LocalPlayer player = client.player;
         if (state == State.OFF || state == State.PAUSED || player == null || client.gameMode == null
                 || client.getConnection() == null) return;
+
+
+        // A running order flow owns the GUI: it is a guarded, recorded sequence and the trading
+        // state machine must not click underneath it. It is ticked separately so it also runs
+        // while the engine itself is off.
+        if (OrderFlow.busy()) return;
         if (cooldown > 0) { cooldown--; return; }
         InventoryMenu inv = player.inventoryMenu;
         Screen screen = client.gui.screen();

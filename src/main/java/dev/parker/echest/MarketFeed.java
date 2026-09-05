@@ -161,6 +161,10 @@ public final class MarketFeed implements ClientModInitializer {
     /** Donut's {@code /bal} reply, used as the cash budget for sniping and floor lifts. */
     private static final Pattern BALANCE_LINE = Pattern.compile(
             "(?i)balance[^0-9$]{0,16}\\$?\\s*[0-9][0-9,]*(?:\\.[0-9]+)?\\s*[kmbt]?");
+    /** Buy-order lifecycle, as recorded: "You ordered 2.5K Obsidian", "…order is complete!". */
+    private static final Pattern ORDER_PLACED = Pattern.compile("(?i)\\byou\\s+ordered\\b");
+    private static final Pattern ORDER_COMPLETE = Pattern.compile("(?i)order\\s+is\\s+complete");
+    private static final Pattern ORDER_DELIVERY = Pattern.compile("(?i)delivered\\s+you\\b");
 
     /** Slots at the bottom of every chest menu that belong to the player's own inventory. */
     static final int PLAYER_INVENTORY_SLOTS = 36;
@@ -591,6 +595,9 @@ public final class MarketFeed implements ClientModInitializer {
         else if (AREA_MAINTENANCE.matcher(text).find()) kind = "MAINTENANCE";
         else if (OFFLINE_SALE.matcher(text).find()) kind = "OFFLINE_SALE";
         else if (BALANCE_LINE.matcher(text).find()) kind = "BALANCE";
+        else if (ORDER_PLACED.matcher(text).find()) kind = "ORDER_PLACED";
+        else if (ORDER_COMPLETE.matcher(text).find()) kind = "ORDER_COMPLETE";
+        else if (ORDER_DELIVERY.matcher(text).find()) kind = "ORDER_DELIVERY";
         if (kind == null) return;
         MarketMessage mm = new MarketMessage(now, kind, text);
         log("msg", kind + " \"" + text + "\"");
