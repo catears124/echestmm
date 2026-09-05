@@ -574,6 +574,16 @@ public final class MarketFeed implements ClientModInitializer {
         if (text == null || text.isBlank()) return;
         // Our own chat output comes back through this event; parsing it would loop forever.
         if (text.contains("[EchestMM]")) return;
+        // Every server line, unconditionally, before any pattern gets a chance to reject it.
+        //
+        // Every regex in this file was written by guessing a format from a handful of examples,
+        // and every guess has been wrong at least once - "balance" was assumed to appear in
+        // Donut's /bal reply and nothing has ever confirmed that, because a line that matches
+        // nothing below is discarded two lines from here with zero trace. That silence is what
+        // let a permanently-unknown cash balance block every acquisition channel without one
+        // line of evidence pointing at why. Nothing may be silently dropped again: if a pattern
+        // should have matched and did not, this line is the fix, not another guess.
+        log("chat", (overlay ? "overlay: " : "") + text);
         long now = System.currentTimeMillis();
 
         Matcher buy = BUY_RECEIPT.matcher(text);
@@ -610,7 +620,13 @@ public final class MarketFeed implements ClientModInitializer {
         else if (ORDER_PLACED.matcher(text).find()) kind = "ORDER_PLACED";
         else if (ORDER_COMPLETE.matcher(text).find()) kind = "ORDER_COMPLETE";
         else if (ORDER_DELIVERY.matcher(text).find()) kind = "ORDER_DELIVERY";
-        if (kind == null) return;
+        if (kind == null) {
+            // Greppable on its own: "grep unmatched echest.log" finds every server line no pattern
+            // in this file recognised, which is exactly the evidence a wrong or missing regex
+            // needs. The [chat] line above already has it too; this just makes it easy to find.
+            log("unmatched", text);
+            return;
+        }
         MarketMessage mm = new MarketMessage(now, kind, text);
         log("msg", kind + " \"" + text + "\"");
         for (Consumer<MarketMessage> l : messageListeners) safely(() -> l.accept(mm));

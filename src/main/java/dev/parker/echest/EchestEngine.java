@@ -223,6 +223,9 @@ public final class EchestEngine {
     private static long cash = -1;
     private static long lastBalanceTick = -1_000_000L;
     private static boolean balanceRequested;
+    private static long balanceRequestedAtMs;
+    /** How long a /bal request waits for a reply before it is allowed to retry. */
+    private static final long BALANCE_REPLY_TIMEOUT_MS = 15_000L;
 
     private static Desk.Calibration lastCalibration;
     private static Liquidity.Quote lastQuote;
@@ -485,6 +488,17 @@ public final class EchestEngine {
                             invalidateCaches();
                             lastCalibration = null;
                             return feedback(ctx.getSource()::sendFeedback, dropped);
+                        }))
+                        .then(literal("bal").executes(ctx -> {
+                            // Manual override: the automatic timeout is 15s, and there is no
+                            // reason to make anyone wait it out if cash is already suspected
+                            // wrong. This forces exactly the same request path CHECK_OWN uses.
+                            balanceRequested = false;
+                            lastBalanceTick = -1_000_000L;
+                            return feedback(ctx.getSource()::sendFeedback,
+                                    "forcing a fresh /bal; current cash=" + (cash < 0 ? "unknown" : "$" + cash)
+                                    + ". Watch echest.log for \"sent /bal\" and the \"[chat]\" line right "
+                                    + "after it - that pair is the actual reply text.");
                         }))
                         .then(literal("snipe").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
                             sniping = BoolArgumentType.getBool(ctx, "on");
@@ -933,7 +947,10 @@ public final class EchestEngine {
     }
 
     private static boolean needBalance() {
-        return (sniping || lifting || acquiring || squeezing)
+        // ordering was missing here: a desk configured to acquire only through orders (obsidian,
+        // as of the last few builds) could reach every gate below with cash genuinely known to be
+        // needed and still never ask for it, because none of its own flags were in this list.
+        return (sniping || lifting || acquiring || squeezing || ordering)
                 && (cash < 0 || ticks - lastBalanceTick >= BALANCE_REFRESH_TICKS);
     }
 
@@ -1022,10 +1039,29 @@ public final class EchestEngine {
 
         switch (state) {
             case CHECK_OWN -> {
+                // Every send in this state machine is traced except this one, and cash has been
+                // -1 (unknown) for this mod's entire logged history as a direct result: there is
+                // no evidence in any session log that /bal was ever sent, or that a reply ever
+                // arrived, because neither was ever written down. Every acquisition channel gates
+                // on cash > 0, so an unlogged, possibly-never-answered /bal silently disables the
+                // whole buy side with nothing in the log pointing at why.
                 if (needBalance() && !balanceRequested && readyForCommand(player, inv, screen)) {
                     if (!sendCommand(client, "bal")) return;
                     balanceRequested = true;
+                    balanceRequestedAtMs = nowMs;
+                    trace("sent /bal (cash was " + (cash < 0 ? "unknown" : "$" + cash) + ")");
                     return;
+                }
+                // A request that never gets answered - wrong reply format, rate limit, a dropped
+                // packet - used to leave balanceRequested stuck true forever, since only a parsed
+                // BALANCE message ever clears it. That permanently blocked every future /bal for
+                // the rest of the session. It now expires and logs the fact plainly.
+                if (balanceRequested && nowMs - balanceRequestedAtMs > BALANCE_REPLY_TIMEOUT_MS) {
+                    balanceRequested = false;
+                    trace("no /bal reply understood within "
+                            + (BALANCE_REPLY_TIMEOUT_MS / 1000) + "s; will retry. Check echest.log "
+                            + "for \"[chat]\" or \"[unmatched]\" lines around the send to see the "
+                            + "server's actual reply text.");
                 }
                 if (!readyForCommand(player, inv, screen)) return;
                 if (!sendCommand(client, "ah")) return;
@@ -1741,17 +1777,32 @@ public final class EchestEngine {
         lastLift = Liquidity.LiftPlan.no("not evaluated");
         // ordering counts as a buy channel: without it here, a desk configured to acquire only
         // through orders reported "no buy side" and did nothing.
-        if (!sniping && !lifting && !acquiring && !ordering) return false;
-        if (cash <= 0) return false;
-        if (inventoryRoom(Minecraft.getInstance()) <= 0) return false;
+        if (!sniping && !lifting && !acquiring && !ordering) {
+            return noBuy("no acquisition channel is on (sniping/lifting/acquiring/ordering all false)");
+        }
+        if (cash <= 0) {
+            return noBuy("cash unknown or zero (cash=" + cash + "); waiting on a /bal reply");
+        }
+        if (inventoryRoom(Minecraft.getInstance()) <= 0) {
+            return noBuy("no inventory room to hold an acquisition");
+        }
 
         // Acquisition prices against every lot in the book, not only stack-sized ones: a cheap
         // 17-item listing is cheap obsidian, and orders and quickbuys both take it happily.
         List<Liquidity.Level> levels = supplyLevels();
-        if (levels.isEmpty()) return false;
+        if (levels.isEmpty()) {
+            return noBuy("no book read yet (" + lastAnyLots + " " + itemId + " lots seen last scan)");
+        }
         Liquidity.Quote quote = quoteNow();
         lastQuote = quote;
         long floor = levels.getFirst().unitPrice();
+
+        // A resale anchor shared by every acquisition channel. Snipe and lift used to be priced
+        // off the sell-side quote directly, which is 0 whenever the sell side has no stack-sized
+        // lots to compare against - even when supplyLevels() (any lot size) has plenty to buy.
+        // That silently starved quickbuy and the floor lift on exactly the sessions where paging
+        // was needed to find real supply. One anchor, one piece of evidence, for every channel.
+        long resaleAnchor = sweepResaleAsk(quote);
 
         // Acquisition by order, which supersedes clicking when it is available: one posted order
         // fills cheapest-first across the whole tail, where the click path spent an action per
@@ -1765,11 +1816,10 @@ public final class EchestEngine {
                         ? Math.max(0, maxHoldUnits * Math.max(1, unitSize) - heldUnits)
                         : Integer.MAX_VALUE;
                 long orderCash = Math.min(cash, Math.round(maxOrderCost / Math.max(0.01, cfg.maxCashSharePct())));
-                long resale = sweepResaleAsk(quote);
-                Sweep.Plan sweep = resale <= 0
+                Sweep.Plan sweep = resaleAnchor <= 0
                         ? Sweep.Plan.no("no evidenced resale price yet: sell a few units first, "
                                 + "then the sweep has something to price against")
-                        : Sweep.plan(levels, resale, orderCash, roomUnits, minOrderProfit, cfg);
+                        : Sweep.plan(levels, resaleAnchor, orderCash, roomUnits, minOrderProfit, cfg);
                 if (sweep.go() && sweep.modelledCost() > maxOrderCost) {
                     sweep = Sweep.Plan.no("modelled cost " + sweep.modelledCost()
                             + " exceeds the " + maxOrderCost + " max order size");
@@ -1782,6 +1832,7 @@ public final class EchestEngine {
                     OrderFlow.place(itemId, deskItemName(), sweep.units(), sweep.ceilingPrice());
                     return false;   // the order flow owns the GUI until it finishes
                 }
+                trace("order sweep refused: " + sweep.reason());
             }
         }
 
@@ -1810,10 +1861,12 @@ public final class EchestEngine {
             }
         }
 
-        long snipeAt = sniping ? Liquidity.snipeCeiling(quote.unitPrice(), cfg) : 0;
+        // Snipe and lift now price off the shared resale anchor, not the possibly-empty sell
+        // quote - see the comment above resaleAnchor.
+        long snipeAt = sniping ? Liquidity.snipeCeiling(resaleAnchor, cfg) : 0;
         long liftAt = 0;
         if (lifting) {
-            Liquidity.LiftPlan plan = Liquidity.planFloorLift(levels, quote.unitPrice(),
+            Liquidity.LiftPlan plan = Liquidity.planFloorLift(levels, resaleAnchor,
                     countInventory(Minecraft.getInstance()), Math.max(0, localFree), cash, cfg);
             lastLift = plan;
             if (plan.go()) liftAt = plan.buyUpTo();
@@ -1822,11 +1875,19 @@ public final class EchestEngine {
         // A live squeeze takes everything under its ask; that is the point of it.
         long squeezeAt = squeeze != null && squeeze.go() ? squeeze.sweepCeiling() : 0;
         long ceiling = Math.max(squeezeAt, Math.max(ladderAt, Math.max(snipeAt, liftAt)));
-        if (ceiling <= 0 || floor > ceiling) return false;
+        if (ceiling <= 0 || floor > ceiling) {
+            return noBuy("no channel wants to buy: floor " + floor + "/item, resale anchor "
+                    + (resaleAnchor > 0 ? resaleAnchor + "/item" : "none")
+                    + ", snipe ceiling " + snipeAt + ", lift " + liftAt + ", ladder " + ladderAt
+                    + ", squeeze " + squeezeAt);
+        }
 
         buyMaxPay = ceiling;   // unit price
         buyBudgetRemaining = (long) Math.floor(cash * cfg.maxCashSharePct());
-        if (buyBudgetRemaining < floor) return false;
+        if (buyBudgetRemaining < floor) {
+            return noBuy("budget " + buyBudgetRemaining + " (from $" + cash + " cash) is under "
+                    + "the " + floor + "/item floor");
+        }
         if (ceiling == squeezeAt) {
             buyReason = "squeeze sweep: taking everything at or under " + squeezeAt + "/item to lift "
                     + "the floor to our " + squeeze.askUnitPrice() + "/item asks";
@@ -1836,9 +1897,32 @@ public final class EchestEngine {
         } else if (liftAt >= snipeAt) {
             buyReason = "lift floor: " + lastLift.reason();
         } else {
-            buyReason = "snipe under " + snipeAt + "/item (ask " + quote.unitPrice() + "/item)";
+            buyReason = "snipe under " + snipeAt + "/item (resale anchor " + resaleAnchor + "/item)";
         }
         return true;
+    }
+
+    private static long lastNoBuyLogMs;
+    private static String lastNoBuyReason = "";
+
+    /**
+     * Every reason {@link #planBuy} declines to act, on the record.
+     *
+     * <p>Rate-limited rather than silent or per-tick: a desk sitting in {@code WAIT_FULL} calls
+     * this every tick, and logging that verbatim would drown the file. But the exact same
+     * reason, unlogged, is what let a permanently-unknown cash balance disable this entire method
+     * for the whole session with nothing in {@code echest.log} to show for it. Every distinct
+     * reason gets logged at least once immediately, and the current reason is repeated at most
+     * once every 30 seconds for as long as it holds.
+     */
+    private static boolean noBuy(String reason) {
+        long nowMs = System.currentTimeMillis();
+        if (!reason.equals(lastNoBuyReason) || nowMs - lastNoBuyLogMs > 30_000L) {
+            trace("not buying: " + reason);
+            lastNoBuyReason = reason;
+            lastNoBuyLogMs = nowMs;
+        }
+        return false;
     }
 
     /**
