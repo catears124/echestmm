@@ -74,6 +74,10 @@ public final class EchestEngine {
     private static final int SOLD_TIMEOUT_TICKS = 80;
     private static final int FULL_RECHECK_TICKS = 200;
     private static final int MARKET_RECHECK_TICKS = 600;
+    /** With no stock, how often the book is re-read so a sweep is priced on current data. */
+    private static final int MARKET_REFRESH_WHILE_EMPTY_TICKS = 100;
+    /** Price levels printed by {@code /echestmm book}. */
+    private static final int BOOK_LADDER_LINES = 12;
     private static final int OWN_REREAD_EVERY = 25;
     private static final int BALANCE_REFRESH_TICKS = 2400;
 
@@ -448,6 +452,12 @@ public final class EchestEngine {
                                 })))
                         .then(literal("sweep").executes(ctx ->
                                 feedback(ctx.getSource()::sendFeedback, lastSweep.reason())))
+                        .then(literal("book").executes(ctx -> {
+                            for (String line : bookLadder()) {
+                                ctx.getSource().sendFeedback(Component.literal(line));
+                            }
+                            return Command.SINGLE_SUCCESS;
+                        }))
                         .then(literal("maxorder").then(argument("dollars", IntegerArgumentType.integer(0))
                                 .executes(ctx -> {
                                     maxOrderCost = IntegerArgumentType.getInteger(ctx, "dollars");
@@ -542,9 +552,13 @@ public final class EchestEngine {
                 searchTerm = "obsidian";
                 unitSize = 64;
                 selling = true;
-                sniping = false;     // the squeeze owns the buy side here
+                // Three acquisition channels, cheapest-per-action first. Orders rest at our price
+                // and get delivered to us; quickbuy takes the cheap tail the moment it appears;
+                // the squeeze posts above the book before sweeping beneath it. Turning all of
+                // them off is what left this desk watching a 350-vs-1250 spread do nothing.
+                sniping = true;      // quickbuy the cheap tail off the open page
                 lifting = false;     // superseded by the squeeze, which posts before it sweeps
-                acquiring = false;
+                acquiring = false;   // the bid ladder is the order's job now
                 squeezing = true;
             }
             default -> {
@@ -1006,6 +1020,22 @@ public final class EchestEngine {
                 }
             }
             case WAIT_FULL -> {
+                // Out of stock is not out of work, and this state used to prove otherwise: it
+                // counted ticks while the obsidian book sat at floor 1250/item against a 350/item
+                // basis. "The buy side keeps working" was a claim nothing in here implemented.
+                //
+                // With no inventory the desk's whole job is acquisition, so the buy side is
+                // consulted first - order sweep or quickbuy, whichever the planner picks.
+                if (planBuy()) {
+                    setState(State.BUY_OPEN, "out of stock; " + buyReason);
+                    return;
+                }
+                // A stale book is why a sweep gets refused, so refresh it rather than wait out the
+                // full recheck: the market read is what every buy decision is made from.
+                if (waited > 0 && waited % MARKET_REFRESH_WHILE_EMPTY_TICKS == 0) {
+                    setState(State.CHECK_MARKET, "out of stock; re-reading the book to price a sweep");
+                    return;
+                }
                 if (++waited >= FULL_RECHECK_TICKS) {
                     localFree = -1;
                     setState(State.CHECK_OWN, "re-check after wait");
@@ -1408,6 +1438,76 @@ public final class EchestEngine {
                         + "/item) rather than the book's " + quote.unitPrice());
     }
 
+    /**
+     * What a swept item can actually be resold for.
+     *
+     * <p>Not simply the current quote. The obsidian book was read at floor 1250/item on an evening
+     * when realised sales were nearer 470, and a sweep priced off that floor would have paid
+     * ~1060/item for stock worth half of it - buying someone else's optimism with real money.
+     *
+     * <p>So the resale price used for buying is the lower of what the book says we could ask and
+     * what we have actually been paid. With no realised sales and no calibration there is no
+     * evidenced resale price at all, and the honest answer is to refuse the sweep rather than
+     * invent one: {@code 0} means "sell something first".
+     */
+    private static long sweepResaleAsk(Liquidity.Quote quote) {
+        long booked = quote == null ? 0 : quote.unitPrice();
+        long realised = realisedSaleMedian();
+        if (realised > 0 && booked > 0) return Math.min(booked, realised);
+        if (realised > 0) return realised;
+        // No fills of our own yet: a calibrated desk has a median to lean on, an uncalibrated one
+        // has nothing, and guessing from a thin book is how you overpay.
+        if (lastCalibration != null && lastCalibration.ladderReady()) {
+            return Math.min(booked, Math.max(1L, lastCalibration.bidCeiling()));
+        }
+        return 0;
+    }
+
+    /** Realised average unit price of our own sales; the only resale evidence that is ours. */
+    private static long realisedSaleMedian() {
+        if (sold <= 0 || grossSold <= 0) return 0;
+        long items = (long) sold * Math.max(1, unitSize);
+        return items > 0 ? Math.round(grossSold / (double) items) : 0;
+    }
+
+    /**
+     * The desk's book as a price ladder: level, size, and cumulative depth.
+     *
+     * <p>This is the data every decision here is made from - the sweep ceiling, the regime, the
+     * quote and the order price - so it is worth being able to read directly. Depth is cumulative
+     * from the cheapest ask upward, which is the order a buy order fills in, so the line where
+     * cumulative cost crosses the risk cap is the order that should be posted.
+     */
+    private static List<String> bookLadder() {
+        List<Liquidity.Level> levels = new ArrayList<>(competingLevels());
+        if (levels.isEmpty()) {
+            return List.of("[EchestMM] " + itemId + ": no book read yet (or nobody is selling)");
+        }
+        levels.sort((a, b) -> Long.compare(a.unitPrice(), b.unitPrice()));
+        long avgCost = averageAcquisitionCost();
+        Liquidity.Quote quote = lastQuote;
+        List<String> out = new ArrayList<>();
+        out.add("[EchestMM] " + itemId + " book: " + Liquidity.classify(levels)
+                + ", our ask " + (quote == null ? "n/a" : quote.unitPrice() + "/item")
+                + (avgCost > 0 ? ", basis " + avgCost + "/item" : ", no basis yet"));
+        int cumUnits = 0;
+        long cumCost = 0;
+        int shown = 0;
+        for (Liquidity.Level level : levels) {
+            cumUnits += level.units();
+            cumCost += level.unitPrice() * (long) level.units();
+            if (shown++ >= BOOK_LADDER_LINES) continue;
+            String mine = ownPriceCounts.containsKey(level.unitPrice()) ? " <- ours" : "";
+            out.add(String.format(Locale.ROOT, "  %,7d/item  %2d listings  %5d units  depth %,6d units / $%,d%s",
+                    level.unitPrice(), level.listings(), level.units(), cumUnits, cumCost, mine));
+        }
+        if (levels.size() > BOOK_LADDER_LINES) {
+            out.add("  ... " + (levels.size() - BOOK_LADDER_LINES) + " deeper levels, "
+                    + cumUnits + " units total");
+        }
+        return out;
+    }
+
     /** Realised average cost per item across everything this desk has acquired. */
     private static long averageAcquisitionCost() {
         long items = 0;
@@ -1463,7 +1563,9 @@ public final class EchestEngine {
         buyReason = "";
         buyBudgetRemaining = 0;
         lastLift = Liquidity.LiftPlan.no("not evaluated");
-        if (!sniping && !lifting && !acquiring) return false;
+        // ordering counts as a buy channel: without it here, a desk configured to acquire only
+        // through orders reported "no buy side" and did nothing.
+        if (!sniping && !lifting && !acquiring && !ordering) return false;
         if (cash <= 0) return false;
         if (inventoryRoom(Minecraft.getInstance()) <= 0) return false;
 
@@ -1485,8 +1587,11 @@ public final class EchestEngine {
                         ? Math.max(0, maxHoldUnits * Math.max(1, unitSize) - heldUnits)
                         : Integer.MAX_VALUE;
                 long orderCash = Math.min(cash, Math.round(maxOrderCost / Math.max(0.01, cfg.maxCashSharePct())));
-                Sweep.Plan sweep = Sweep.plan(levels, quote.unitPrice(), orderCash, roomUnits,
-                        minOrderProfit, cfg);
+                long resale = sweepResaleAsk(quote);
+                Sweep.Plan sweep = resale <= 0
+                        ? Sweep.Plan.no("no evidenced resale price yet: sell a few units first, "
+                                + "then the sweep has something to price against")
+                        : Sweep.plan(levels, resale, orderCash, roomUnits, minOrderProfit, cfg);
                 if (sweep.go() && sweep.modelledCost() > maxOrderCost) {
                     sweep = Sweep.Plan.no("modelled cost " + sweep.modelledCost()
                             + " exceeds the " + maxOrderCost + " max order size");
