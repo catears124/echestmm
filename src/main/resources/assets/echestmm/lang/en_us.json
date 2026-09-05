@@ -1,4 +1,6 @@
 {
   "category.echestmm": "EchestMM",
-  "key.echestmm.panic": "Panic on/off"
+  "key.echestmm.panic": "Panic on/off",
+  "key.echestmm.dump": "Dump the open screen",
+  "key.echestmm.collect": "Collect from this order screen"
 }

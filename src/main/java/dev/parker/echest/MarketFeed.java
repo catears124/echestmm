@@ -436,7 +436,7 @@ public final class MarketFeed implements ClientModInitializer {
         return b.toString();
     }
 
-    private static void dumpOpenScreen(Minecraft client, Consumer<Component> feedback) {
+    static void dumpOpenScreen(Minecraft client, Consumer<Component> feedback) {
         Screen screen = client.gui.screen();
         if (!(screen instanceof AbstractContainerScreen<?> container)) {
             feedback.accept(Component.literal("[EchestMM] no container screen is open"));

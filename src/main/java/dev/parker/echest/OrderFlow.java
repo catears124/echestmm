@@ -84,6 +84,11 @@ public final class OrderFlow {
     private static long stepAtMs;
     private static String note = "idle";
     private static int typed;
+    private static int emptyScans;
+    private static int taken;
+
+    /** Consecutive empty reads of the collect chest required before believing it is empty. */
+    private static final int EMPTY_SCANS_BEFORE_DONE = 6;
 
     private OrderFlow() {}
 
@@ -113,17 +118,43 @@ public final class OrderFlow {
         return note;
     }
 
-    /** Starts collecting whatever a completed order has delivered. */
+    /** Starts collecting whatever a completed order has delivered, from scratch via /orders. */
     public static String collect(String deskItemId) {
         if (busy()) return "already running: " + step + " (" + note + ")";
         itemId = deskItemId;
+        emptyScans = 0;
+        taken = 0;
         advance(Step.COLLECT_OPEN, "collecting delivered " + deskItemId);
         return note;
     }
 
-    public static void abort(String why) {
-        if (!busy()) return;
-        advance(Step.FAILED, "aborted: " + why);
+    /**
+     * Resumes collection from the screen that is already open.
+     *
+     * <p>Navigation is the fragile part of this flow, so when you have already walked to the right
+     * screen there is no reason to make the machine walk there again - and no way to tell it to,
+     * since chat is unreachable with a container open. The open screen's title says which step we
+     * are on, so this just starts there.
+     */
+    public static String collectFrom(Minecraft client, String deskItemId) {
+        Screen screen = client.gui.screen();
+        String title = screen == null || screen.getTitle() == null ? ""
+                : screen.getTitle().getString().toLowerCase(Locale.ROOT);
+        itemId = deskItemId;
+        emptyScans = 0;
+        taken = 0;
+        if (title.contains(COLLECT_ITEMS)) {
+            advance(Step.COLLECT_TAKE, "resuming on the collect screen");
+        } else if (title.contains(EDIT_ORDER)) {
+            advance(Step.COLLECT_CHEST, "resuming on the edit screen");
+        } else if (title.contains(YOUR_ORDERS)) {
+            advance(Step.COLLECT_EDIT, "resuming on your orders");
+        } else if (title.contains(ORDERS_ROOT)) {
+            advance(Step.COLLECT_YOUR_ORDERS, "resuming on the orders root");
+        } else {
+            advance(Step.COLLECT_OPEN, "no order screen open; walking there");
+        }
+        return note;
     }
 
     /** Called from the engine tick while this flow owns the GUI. Returns true if it acted. */
@@ -226,12 +257,25 @@ public final class OrderFlow {
                 if (!(screen instanceof AbstractContainerScreen<?> c) || !title.contains(COLLECT_ITEMS)) yield false;
                 int slot = findDeskItemSlot(c);
                 if (slot < 0) {
+                    // One empty read is not an empty chest. The server sends the collect screen
+                    // before it fills, and it restates the whole container after every shift-click,
+                    // so a single blank frame mid-update used to end the flow with stacks still in
+                    // there - which is exactly the way this failed. Require several in a row.
+                    if (++emptyScans < EMPTY_SCANS_BEFORE_DONE) yield false;
+                    if (taken == 0) {
+                        advance(Step.FAILED, "collect screen never showed any " + itemId
+                                + " - shift-click them out by hand and tell me what it looked like");
+                        yield false;
+                    }
                     closeScreen(player, screen);
-                    advance(Step.DONE, "collected everything the order delivered");
+                    advance(Step.DONE, "collected " + taken + " stacks");
                     yield true;
                 }
+                emptyScans = 0;
                 // Shift-click, exactly as recorded: QUICK_MOVE with button 1.
-                yield click(client, player, c, slot, ContainerInput.QUICK_MOVE, nowMs);
+                if (!click(client, player, c, slot, ContainerInput.QUICK_MOVE, nowMs)) yield false;
+                taken++;
+                yield true;
             }
             default -> false;
         };

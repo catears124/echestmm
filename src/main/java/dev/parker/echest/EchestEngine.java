@@ -202,6 +202,15 @@ public final class EchestEngine {
     private static final KeyMapping.Category PANIC_CATEGORY = KeyMapping.Category.register(
             Identifier.fromNamespaceAndPath("echestmm", "controls"));
     private static KeyMapping panicKey;
+    /**
+     * Dump and collect keys, default {@code .} and {@code ;}.
+     *
+     * <p>These exist because chat is unreachable with a container open - which is precisely when
+     * both are useful. Dumping the auction page and collecting from an order screen are things you
+     * do <em>while looking at that screen</em>, so they cannot be commands.
+     */
+    private static KeyMapping dumpKey;
+    private static KeyMapping collectKey;
 
     private static void registerPanicKey() {
         panicKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
@@ -209,11 +218,21 @@ public final class EchestEngine {
                 InputConstants.Type.KEYSYM,
                 InputConstants.KEY_COMMA,
                 PANIC_CATEGORY));
+        dumpKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.echestmm.dump",
+                InputConstants.Type.KEYSYM,
+                InputConstants.KEY_PERIOD,
+                PANIC_CATEGORY));
+        collectKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.echestmm.collect",
+                InputConstants.Type.KEYSYM,
+                InputConstants.KEY_SEMICOLON,
+                PANIC_CATEGORY));
         ScreenEvents.AFTER_INIT.register((client, screen, w, h) ->
                 ScreenKeyboardEvents.afterKeyPress(screen).register((s, event) -> {
-                    if (panicKey != null && panicKey.matches(event)) {
-                        togglePanic(client);
-                    }
+                    if (panicKey != null && panicKey.matches(event)) togglePanic(client);
+                    else if (dumpKey != null && dumpKey.matches(event)) dumpHere(client);
+                    else if (collectKey != null && collectKey.matches(event)) collectHere(client);
                 }));
     }
 
@@ -221,6 +240,27 @@ public final class EchestEngine {
         boolean pressed = false;
         while (panicKey != null && panicKey.consumeClick()) pressed = true;
         if (pressed) togglePanic(client);
+        boolean dump = false;
+        while (dumpKey != null && dumpKey.consumeClick()) dump = true;
+        if (dump) dumpHere(client);
+        boolean collect = false;
+        while (collectKey != null && collectKey.consumeClick()) collect = true;
+        if (collect) collectHere(client);
+    }
+
+    /** Writes whatever screen is open right now to the dump file, GUI open or not. */
+    private static void dumpHere(Minecraft client) {
+        MarketFeed.dumpOpenScreen(client, msg -> {
+            if (client.player != null) client.player.sendSystemMessage(msg);
+        });
+    }
+
+    /** Resumes collection from whatever order screen is already in front of you. */
+    private static void collectHere(Minecraft client) {
+        String result = OrderFlow.collectFrom(client, itemId);
+        if (client.player != null) {
+            client.player.sendSystemMessage(Component.literal("[EchestMM] " + result));
+        }
     }
 
     private static void togglePanic(Minecraft client) {
