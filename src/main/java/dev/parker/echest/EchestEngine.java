@@ -158,6 +158,7 @@ public final class EchestEngine {
     private static long lastBalanceTick = -1_000_000L;
     private static boolean balanceRequested;
 
+    private static Desk.Calibration lastCalibration;
     private static Liquidity.Quote lastQuote;
     private static Liquidity.LiftPlan lastLift = Liquidity.LiftPlan.no("not evaluated");
     private static Liquidity.BidPlan lastBid = new Liquidity.BidPlan(false, 0, "not evaluated");
@@ -191,6 +192,8 @@ public final class EchestEngine {
                         })
                         .then(literal("status").executes(ctx -> feedback(ctx.getSource()::sendFeedback, status())))
                         .then(literal("pace").executes(ctx -> feedback(ctx.getSource()::sendFeedback, pacing())))
+                        .then(literal("calibrate").executes(ctx ->
+                                feedback(ctx.getSource()::sendFeedback, calibrate())))
                         .then(literal("debug").executes(ctx -> {
                             debug = !debug;
                             return feedback(ctx.getSource()::sendFeedback, "trace " + (debug ? "ON" : "OFF"));
@@ -279,7 +282,11 @@ public final class EchestEngine {
         );
     }
 
-    /** Preset desks, so switching between the two markets is one command. */
+    /**
+     * Selects a desk. Only the market's structure is fixed here - which item, how many go in one
+     * listing, and which sides make sense. Every price level comes from {@link Desk#derive}, which
+     * reads this account's realised trades out of the log.
+     */
     private static String applyDesk(String name) {
         switch (name) {
             case "echest", "enderchest", "ender_chest" -> {
@@ -289,22 +296,16 @@ public final class EchestEngine {
                 selling = true;
                 sniping = true;
                 lifting = true;
-                acquiring = false;
-                cfg = withFallback(withMin(Liquidity.Config.defaults(), 4_000), 25_000);
+                acquiring = false;   // chests are crafted, not bought
             }
             case "obsidian", "obby" -> {
                 itemId = "minecraft:obsidian";
                 searchTerm = "obsidian";
                 unitSize = 64;
                 selling = true;
-                sniping = false;      // the ladder is the buy side here, not opportunistic snipes
+                sniping = false;     // the ladder is the buy side here, not opportunistic snipes
                 lifting = true;
                 acquiring = true;
-                cfg = withFallback(withMin(Liquidity.Config.defaults(), 15_000), 40_000);
-                bidStart = 25_000;
-                bidStep = 500;
-                minSpreadPct = 0.25;
-                maxHoldUnits = 20;
             }
             default -> {
                 return "unknown desk \"" + name + "\"; use echest or obsidian";
@@ -312,11 +313,30 @@ public final class EchestEngine {
         }
         currentBid = 0;
         invalidateCaches();
-        return "desk " + name + ": " + itemId + " x" + unitSize + " per listing, sell="
-                + selling + " acquire=" + acquiring + " lift=" + lifting
-                + ", min " + cfg.minPrice() + ", empty-book " + cfg.fallbackPrice()
-                + (acquiring ? ", ladder from " + bidStart + " step " + bidStep
-                    + " under a " + Math.round(minSpreadPct * 100) + "% spread" : "");
+        return "desk " + name + ": " + itemId + " x" + unitSize + " per listing. " + calibrate();
+    }
+
+    /**
+     * Re-derives every price level for the current desk from realised trades. Called on a desk
+     * switch and by {@code /echestmm calibrate}; safe to run mid-session.
+     */
+    private static String calibrate() {
+        Liquidity.Config base = cfg.tick() > 0 ? cfg : Liquidity.Config.defaults();
+        History.Samples samples = History.load(itemId, unitSize, 500);
+        Desk.Calibration cal = Desk.derive(samples, cash, base);
+        cfg = cal.cfg();
+        lastCalibration = cal;
+        if (cal.ladderReady()) {
+            bidStart = cal.bidStart();
+            bidStep = cal.bidStep();
+            minSpreadPct = cal.minSpreadPct();
+            if (cal.maxHoldUnits() > 0) maxHoldUnits = cal.maxHoldUnits();
+            currentBid = 0;
+        } else if (acquiring) {
+            acquiring = false;   // never bid on invented numbers
+        }
+        MarketFeed.log("desk", itemId + " x" + unitSize + ": " + cal.evidence());
+        return cal.evidence();
     }
 
     private static Liquidity.Config withMin(Liquidity.Config c, long v) {
@@ -360,7 +380,10 @@ public final class EchestEngine {
                 + " | bought=" + bought + " ($" + grossBought + ")"
                 + (acquiring ? " | bid=" + currentBid + " acquired=" + acquired + " ($" + acquiredCost + ")" : "")
                 + " | cash=" + (cash < 0 ? "unknown" : "$" + cash)
-                + " | pace=" + String.format(Locale.ROOT, "%.2f/s", ActionPacer.cap());
+                + " | pace=" + String.format(Locale.ROOT, "%.2f/s", ActionPacer.cap())
+                + " | levels from " + (lastCalibration == null ? "defaults (not calibrated)"
+                        : lastCalibration.samples() + " realised trades"
+                          + (lastCalibration.ladderReady() ? "" : " - too few, ladder off"));
     }
 
     private static String pacing() {
@@ -485,6 +508,10 @@ public final class EchestEngine {
                     lastBalanceTick = ticks;
                     balanceRequested = false;
                     trace("balance $" + cash);
+                    // The hold cap is a function of cash; derive it now that cash is known.
+                    if (acquiring && lastCalibration != null && lastCalibration.maxHoldUnits() == 0) {
+                        calibrate();
+                    }
                 }
             }
             default -> { }
