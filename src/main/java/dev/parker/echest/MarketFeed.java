@@ -162,9 +162,6 @@ public final class MarketFeed implements ClientModInitializer {
 
     /** Slots at the bottom of every chest menu that belong to the player's own inventory. */
     static final int PLAYER_INVENTORY_SLOTS = 36;
-    /** The own-listings chest shows the player's slots in its first two rows only. */
-    private static final int OWN_LISTING_SLOTS = 18;
-
     private static TextLogger logger;
     private static String lastPageFingerprint = "";
     private static String lastOwnFingerprint = "";
@@ -196,6 +193,11 @@ public final class MarketFeed implements ClientModInitializer {
                                     "[EchestMM] own-listing read announcements " + (announceOwnReads ? "ON" : "OFF")));
                             return Command.SINGLE_SUCCESS;
                         }))
+                        .then(literal("layout").executes(ctx -> {
+                            ctx.getSource().sendFeedback(Component.literal(
+                                    "[EchestMM] last Your Items read: " + lastOwnLayout));
+                            return Command.SINGLE_SUCCESS;
+                        }))
                 )
         );
 
@@ -219,7 +221,8 @@ public final class MarketFeed implements ClientModInitializer {
                 latestOwnListings = own; // refresh the timestamp even when unchanged, so waiters progress
                 if (own.fingerprint.equals(lastOwnFingerprint)) return;
                 lastOwnFingerprint = own.fingerprint;
-                log("own", own.active + " taken, " + own.free + " free, " + own.locked + " locked");
+                log("own", own.active + " taken, " + own.free + " free, " + own.locked + " locked | "
+                        + lastOwnLayout);
                 if (announceOwnReads) {
                     client.player.sendSystemMessage(Component.literal(String.format(Locale.ROOT,
                             "[EchestMM] your listings: %d taken, %d free%s", own.active, own.free,
@@ -288,44 +291,105 @@ public final class MarketFeed implements ClientModInitializer {
 
     // ---- own listings screen ---------------------------------------------------------------
 
+    /**
+     * Reads the player's own listings screen.
+     *
+     * <p>This deliberately makes no assumption about how many rows the screen has or where the
+     * free slots sit. The first version scanned a fixed 18 slots because that is what one account
+     * happened to show; an account with more listing slots reported "18 taken, 0 free" while whole
+     * rows of free slots sat below the window, and the engine concluded the auction house was
+     * full. Every slot in the container's own section is classified instead:
+     *
+     * <ul>
+     *   <li>a glass pane whose name mentions listing or selling is a <b>free</b> slot;</li>
+     *   <li>a red pane, or one whose name mentions locking or unlocking, is <b>locked</b>;</li>
+     *   <li>anything carrying a price is an <b>active listing</b>;</li>
+     *   <li>anything else - navigation arrows, heads, decorative filler - is ignored.</li>
+     * </ul>
+     */
     static OwnListings scanOwnListings(Minecraft client, AbstractContainerScreen<?> screen, String title, long now) {
         AbstractContainerMenu menu = screen.getMenu();
         List<ItemStack> stacks = menu.getItems();
         int topSlots = Math.max(0, stacks.size() - PLAYER_INVENTORY_SLOTS);
-        if (topSlots < OWN_LISTING_SLOTS) return null;
+        if (topSlots <= 0) return null;
 
         int free = 0;
         int locked = 0;
         int empty = 0;
+        int ignored = 0;
         boolean sawListPane = false;
         ArrayList<Listing> listings = new ArrayList<>();
         StringBuilder fp = new StringBuilder(256).append(title).append('|');
-        for (int slot = 0; slot < OWN_LISTING_SLOTS; slot++) {
+        for (int slot = 0; slot < topSlots; slot++) {
             ItemStack stack = stacks.get(slot);
             if (stack == null || stack.isEmpty()) { empty++; fp.append('_'); continue; }
             Identifier id = BuiltInRegistries.ITEM.getKey(stack.getItem());
             String idText = id == null ? "" : id.toString();
-            String name = stack.getDisplayName().getString();
-            if (idText.equals("minecraft:gray_stained_glass_pane") || idText.equals("minecraft:black_stained_glass_pane")) {
-                free++;
-                fp.append('b');
-                if (name.toLowerCase(Locale.ROOT).contains("list")) sawListPane = true;
-                continue;
-            }
-            if (idText.equals("minecraft:red_stained_glass_pane")) { locked++; fp.append('r'); continue; }
             List<Component> tip = tooltipLines(client, stack);
             double price = priceFromTooltipLines(tip);
-            String tooltip = joinLines(tip, " | ");
-            int count = Math.max(1, stack.getCount());
-            listings.add(new Listing(now, slot, idText, name, count, price,
-                    Double.isFinite(price) ? price / count : Double.NaN, parseSeller(tooltip), tooltip));
-            fp.append(slot).append(':').append(idText).append(':').append(count).append(':')
-                    .append(Double.isFinite(price) ? Math.round(price) : -1).append(';');
+            boolean hasPrice = price > 0.0 && Double.isFinite(price);
+
+            switch (classifyOwnSlot(idText, stack.getDisplayName().getString(), hasPrice)) {
+                case FREE -> { free++; sawListPane = true; fp.append('f'); }
+                case LOCKED -> { locked++; fp.append('r'); }
+                case OTHER -> { ignored++; fp.append('.'); }
+                case LISTING -> {
+                    String tooltip = joinLines(tip, " | ");
+                    int count = Math.max(1, stack.getCount());
+                    listings.add(new Listing(now, slot, idText, stack.getDisplayName().getString(),
+                            count, price, price / count, parseSeller(tooltip), tooltip));
+                    fp.append(slot).append(':').append(idText).append(':').append(count).append(':')
+                            .append(Math.round(price)).append(';');
+                }
+            }
         }
+
+        // Accept the screen only on positive evidence: a free-slot pane, or at least one priced
+        // listing on a screen whose title names it. Otherwise this is some other chest.
         boolean titleMatch = title != null && title.toLowerCase(Locale.ROOT).contains("your");
-        if (!sawListPane && !(free == 0 && titleMatch)) return null;
-        return new OwnListings(now, title, listings.size(), free, locked, empty,
+        if (!sawListPane && !(titleMatch && !listings.isEmpty())) return null;
+
+        // Some layouts leave a free slot genuinely empty instead of filling it with a "List" pane.
+        // Treating those as taken is what produced a false "auction house full", so empties count
+        // as free when the screen showed no free-slot panes at all.
+        int freeSlots = free;
+        String note = "";
+        if (free == 0 && empty > 0) {
+            freeSlots = empty;
+            note = " (counting " + empty + " empty slots as free: no List panes on this layout)";
+        }
+        lastOwnLayout = topSlots + " slots: " + listings.size() + " listed, " + freeSlots + " free, "
+                + locked + " locked, " + empty + " empty, " + ignored + " other" + note;
+        return new OwnListings(now, title, listings.size(), freeSlots, locked, empty,
                 List.copyOf(listings), fp.toString());
+    }
+
+    /** Last own-listings layout seen, for {@code /echest layout}. */
+    private static volatile String lastOwnLayout = "no own-listings screen read yet";
+
+    /** What one slot of the own-listings screen represents. */
+    enum SlotKind { FREE, LOCKED, LISTING, OTHER }
+
+    /**
+     * Classifies one slot by its item id, display name and whether its tooltip carries a price.
+     * Position is deliberately not an input: the screen's row count varies by account.
+     */
+    static SlotKind classifyOwnSlot(String idText, String displayName, boolean hasPrice) {
+        String id = idText == null ? "" : idText;
+        String name = displayName == null ? "" : displayName.toLowerCase(Locale.ROOT);
+        boolean pane = id.endsWith("_stained_glass_pane") || id.equals("minecraft:glass_pane");
+        if (id.equals("minecraft:red_stained_glass_pane") || name.contains("locked") || name.contains("unlock")) {
+            return SlotKind.LOCKED;
+        }
+        if (pane && (name.contains("list") || name.contains("sell") || name.contains("empty")
+                || name.contains("available") || name.contains("free"))) {
+            return SlotKind.FREE;
+        }
+        return hasPrice ? SlotKind.LISTING : SlotKind.OTHER;
+    }
+
+    public static String lastOwnLayout() {
+        return lastOwnLayout;
     }
 
     static String describeSlots(AbstractContainerMenu menu, int n) {
