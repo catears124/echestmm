@@ -9,6 +9,7 @@ import java.nio.channels.SeekableByteChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
@@ -79,12 +80,54 @@ public final class History {
         };
     }
 
+    /**
+     * Ignores receipts logged before this instant.
+     *
+     * <p>Receipts written before the per-item unit fix recorded stack totals as per-item prices,
+     * and mixing them with corrected ones produced a price series spanning 300 to 38,000 per item.
+     * Old evidence that was measured wrongly is not evidence, so {@code /echestmm forget} sets this
+     * line and everything behind it stops counting. ISO-8601 instants sort lexicographically, so
+     * the comparison is a string prefix test on the line itself.
+     */
+    static String cutoff = "";
+
+    /** Drops every receipt currently on record for a desk, and reports what it dropped. */
+    public static String archive(String itemId) {
+        Samples before = load(itemId, 64, 0);
+        cutoff = Instant.now().toString();
+        save();
+        return "forgot " + before.all().size() + " realised trades for " + itemId
+                + " logged before " + cutoff + "; pricing follows the live book until "
+                + Desk.MIN_SAMPLES + " fresh fills land";
+    }
+
+    private static Path cutoffFile() {
+        return FabricLoader.getInstance().getGameDir().resolve("echestmm").resolve("forget.txt");
+    }
+
+    private static void save() {
+        try {
+            Files.createDirectories(cutoffFile().getParent());
+            Files.writeString(cutoffFile(), cutoff, StandardCharsets.UTF_8);
+        } catch (IOException ignored) {
+        }
+    }
+
+    static void loadCutoff() {
+        try {
+            if (Files.isRegularFile(cutoffFile())) cutoff = Files.readString(cutoffFile()).trim();
+        } catch (IOException ignored) {
+        }
+    }
+
     /** Collects realised prices for {@code itemId} at {@code unitSize} from log lines. */
     static Samples collect(Iterable<String> lines, String itemId, int unitSize, int maxSamples) {
         String path = itemId.substring(itemId.indexOf(':') + 1);
         List<Long> bought = new ArrayList<>();
         List<Long> sold = new ArrayList<>();
         for (String line : lines) {
+            if (!cutoff.isEmpty() && line != null && !line.isEmpty()
+                    && line.charAt(0) == '2' && line.compareTo(cutoff) < 0) continue;
             long[] hit = parseReceipt(line, path, unitSize);
             if (hit == null) continue;
             List<Long> target = hit[0] == 0 ? bought : sold;

@@ -96,6 +96,11 @@ public final class OrderFlow {
         return step != Step.IDLE && step != Step.DONE && step != Step.FAILED;
     }
 
+    /** The per-item price of the most recent order, which is the basis of what it delivers. */
+    public static long lastOrderUnitPrice() {
+        return pricePerItem;
+    }
+
     public static Step step() {
         return step;
     }
@@ -242,8 +247,15 @@ public final class OrderFlow {
             case COLLECT_EDIT -> {
                 if (title.contains(EDIT_ORDER)) { advance(Step.COLLECT_CHEST, "edit order open"); yield true; }
                 if (!(screen instanceof AbstractContainerScreen<?> c) || !title.contains(YOUR_ORDERS)) yield false;
-                int slot = findOrderSlot(c);
-                if (slot < 0) { advance(Step.FAILED, "no live order for " + itemId); yield false; }
+                int slot = findOrderSlot(client, c);
+                if (slot < 0) {
+                    // Dump the screen we could not read, so the next fix is based on evidence
+                    // rather than another guess about what an order tile looks like.
+                    MarketFeed.dumpOpenScreen(client, msg -> {});
+                    advance(Step.FAILED, "no live order for " + itemId
+                            + " on the Your Orders screen; dumped it to screen_dumps.txt");
+                    yield false;
+                }
                 yield click(client, player, c, slot, ContainerInput.PICKUP, nowMs);
             }
             case COLLECT_CHEST -> {
@@ -452,10 +464,37 @@ public final class OrderFlow {
         return -1;
     }
 
-    /** Our order on the Your Orders screen: the desk item, not a "[New Order]" pane. */
-    private static int findOrderSlot(AbstractContainerScreen<?> screen) {
-        return findDeskItemSlot(screen);
+    /**
+     * Our live order on the Your Orders screen.
+     *
+     * <p>Matched by tooltip rather than by item, because the walkthrough recording contained no
+     * live order to learn the tile from - every slot was a {@code [New Order]} pane - and the
+     * icon guess was wrong in practice. What is known, from the Edit Order screen, is the wording
+     * on an order's tooltip: {@code "2.5K requested / $391 each / 2.5K/2.5K Delivered"}. That is
+     * the evidence, so that is what this reads.
+     */
+    private static int findOrderSlot(Minecraft client, AbstractContainerScreen<?> screen) {
+        AbstractContainerMenu menu = screen.getMenu();
+        List<ItemStack> stacks = menu.getItems();
+        int top = Math.max(0, stacks.size() - MarketFeed.PLAYER_INVENTORY_SLOTS);
+        if (top == 0) top = stacks.size();
+        int fallback = -1;
+        for (int i = 0; i < top; i++) {
+            ItemStack stack = stacks.get(i);
+            if (stack == null || stack.isEmpty()) continue;
+            String name = stack.getDisplayName().getString().toLowerCase(Locale.ROOT);
+            if (name.contains("new order")) continue;              // a free slot, not an order
+            String tip = MarketFeed.joinLines(MarketFeed.tooltipLines(client, stack), " | ").toLowerCase(Locale.ROOT);
+            boolean isOrder = tip.contains("delivered") || tip.contains("requested");
+            if (!isOrder) continue;
+            Identifier id = BuiltInRegistries.ITEM.getKey(stack.getItem());
+            boolean ours = id != null && itemId.equals(id.toString());
+            if (ours || tip.contains(itemName.toLowerCase(Locale.ROOT))) return i;
+            if (fallback < 0) fallback = i;
+        }
+        return fallback;
     }
+
 
     private static int findDeskItemSlot(AbstractContainerScreen<?> screen) {
         AbstractContainerMenu menu = screen.getMenu();

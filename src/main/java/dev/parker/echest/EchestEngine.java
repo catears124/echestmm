@@ -85,6 +85,17 @@ public final class EchestEngine {
     private static long minOrderProfit = 25_000L;
     private static long lastOrderMs;
     private static Sweep.Plan lastSweep = Sweep.Plan.no("not evaluated");
+    /**
+     * Hard ceiling on what one buy order may commit.
+     *
+     * <p>The risk limit on the obsidian desk. Orders fill fast and in dozens of pieces - 640 items
+     * arrived from twelve sellers in eighteen seconds - so an oversized order becomes an inventory
+     * problem before it becomes a pricing one.
+     */
+    private static long maxOrderCost = 1_000_000L;
+    /** Items and dollars acquired through orders, which is a real basis and belongs in the cost. */
+    private static long orderedItems;
+    private static long orderedCost;
 
     /** An open auction page younger than this is reused instead of re-searched. */
     private static final long PAGE_FRESH_MS = 1_500L;
@@ -306,6 +317,7 @@ public final class EchestEngine {
         ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::tick);
         // These two run even when the engine is off: the panic key has to be able to switch it on,
         // and a disconnect has to be classified after the fact.
+        History.loadCutoff();
         ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::pollPanicKey);
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (OrderFlow.busy() && client.player != null) {
@@ -436,6 +448,18 @@ public final class EchestEngine {
                                 })))
                         .then(literal("sweep").executes(ctx ->
                                 feedback(ctx.getSource()::sendFeedback, lastSweep.reason())))
+                        .then(literal("maxorder").then(argument("dollars", IntegerArgumentType.integer(0))
+                                .executes(ctx -> {
+                                    maxOrderCost = IntegerArgumentType.getInteger(ctx, "dollars");
+                                    return feedback(ctx.getSource()::sendFeedback,
+                                            "one order may commit at most $" + maxOrderCost);
+                                })))
+                        .then(literal("forget").executes(ctx -> {
+                            String dropped = History.archive(itemId);
+                            invalidateCaches();
+                            lastCalibration = null;
+                            return feedback(ctx.getSource()::sendFeedback, dropped);
+                        }))
                         .then(literal("snipe").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
                             sniping = BoolArgumentType.getBool(ctx, "on");
                             return feedback(ctx.getSource()::sendFeedback, "sniping " + (sniping ? "ON" : "OFF"));
@@ -702,6 +726,16 @@ public final class EchestEngine {
         if (state == State.OFF) return;
         switch (m.kind()) {
             case "RATE_LIMIT" -> ActionPacer.penalize(System.currentTimeMillis(), "server rate-limit line");
+            case "ORDER_DELIVERY" -> {
+                // Deliveries into a resting order are real acquisitions at the order's own price,
+                // so they are the basis the sell side must clear. Without this the cost floor
+                // would think everything was free.
+                int items = MarketFeed.deliveredCount(m.raw());
+                if (items > 0 && OrderFlow.lastOrderUnitPrice() > 0) {
+                    orderedItems += items;
+                    orderedCost += items * OrderFlow.lastOrderUnitPrice();
+                }
+            }
             case "AH_FULL" -> {
                 if (state == State.SELL_CMD || state == State.WAIT_CONFIRM || state == State.WAIT_SOLD) {
                     localFree = 0;
@@ -1350,7 +1384,47 @@ public final class EchestEngine {
                                 : "no fills yet"));
         }
         discoveredAsk = 0;   // a real book is in front of us again; discovery restarts from it
-        return Liquidity.quote(levels, new ArrayList<>(ownPriceCounts.keySet()), clearRate, cfg);
+        return atCostFloor(Liquidity.quote(levels, new ArrayList<>(ownPriceCounts.keySet()),
+                clearRate, cfg));
+    }
+
+    /**
+     * Refuses to quote below what the inventory cost.
+     *
+     * <p>Applied to whatever the book-reading produced, because the book has no idea what our
+     * basis is. This is the guard that stops a poisoned calibration from selling 350/item obsidian
+     * at 300.
+     */
+    private static Liquidity.Quote atCostFloor(Liquidity.Quote quote) {
+        long avgCost = averageAcquisitionCost();
+        long floor = Liquidity.costFloor(avgCost, cfg.snipeMarginPct());
+        if (floor <= 0 || quote == null || quote.unitPrice() >= floor) return quote;
+        long priced = Liquidity.quantize(floor, Math.max(1, cfg.tick() / Math.max(1, unitSize)));
+        priced = Math.max(priced, floor);
+        return new Liquidity.Quote(priced,
+                Liquidity.queueAhead(competingLevels(), new ArrayList<>(ownPriceCounts.keySet()), priced),
+                Double.NaN, Double.NaN,
+                "held at the " + floor + "/item cost floor (paid ~" + avgCost
+                        + "/item) rather than the book's " + quote.unitPrice());
+    }
+
+    /** Realised average cost per item across everything this desk has acquired. */
+    private static long averageAcquisitionCost() {
+        long items = 0;
+        long spend = 0;
+        if (acquired > 0) {
+            items += (long) acquired * Math.max(1, unitSize);
+            spend += acquiredCost;
+        }
+        if (bought > 0) {
+            items += (long) bought * Math.max(1, unitSize);
+            spend += grossBought;
+        }
+        if (orderedItems > 0) {
+            items += orderedItems;
+            spend += orderedCost;
+        }
+        return items > 0 ? Math.round(spend / (double) items) : 0;
     }
 
     /** Median hold time of the last few fills; the underpricing signal. */
@@ -1410,8 +1484,13 @@ public final class EchestEngine {
                 int roomUnits = maxHoldUnits > 0
                         ? Math.max(0, maxHoldUnits * Math.max(1, unitSize) - heldUnits)
                         : Integer.MAX_VALUE;
-                Sweep.Plan sweep = Sweep.plan(levels, quote.unitPrice(), cash, roomUnits,
+                long orderCash = Math.min(cash, Math.round(maxOrderCost / Math.max(0.01, cfg.maxCashSharePct())));
+                Sweep.Plan sweep = Sweep.plan(levels, quote.unitPrice(), orderCash, roomUnits,
                         minOrderProfit, cfg);
+                if (sweep.go() && sweep.modelledCost() > maxOrderCost) {
+                    sweep = Sweep.Plan.no("modelled cost " + sweep.modelledCost()
+                            + " exceeds the " + maxOrderCost + " max order size");
+                }
                 lastSweep = sweep;
                 if (sweep.go()) {
                     lastOrderMs = nowMs;

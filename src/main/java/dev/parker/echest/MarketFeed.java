@@ -165,6 +165,18 @@ public final class MarketFeed implements ClientModInitializer {
     private static final Pattern ORDER_PLACED = Pattern.compile("(?i)\\byou\\s+ordered\\b");
     private static final Pattern ORDER_COMPLETE = Pattern.compile("(?i)order\\s+is\\s+complete");
     private static final Pattern ORDER_DELIVERY = Pattern.compile("(?i)delivered\\s+you\\b");
+    /** "Brorock492 delivered you 145 Obsidian" - the quantity is the acquisition. */
+    private static final Pattern DELIVERED_COUNT = Pattern.compile(
+            "(?i)delivered\\s+you\\s+([0-9][0-9,.]*)\\s*([kmb]?)");
+
+    /** Items delivered into a resting order by one seller, or 0 when the line does not say. */
+    public static int deliveredCount(String text) {
+        if (text == null) return 0;
+        Matcher m = DELIVERED_COUNT.matcher(text);
+        if (!m.find()) return 0;
+        double n = compactNumber(m.group(1), m.group(2));
+        return n > 0 && n < Integer.MAX_VALUE ? (int) Math.round(n) : 0;
+    }
 
     /** Slots at the bottom of every chest menu that belong to the player's own inventory. */
     static final int PLAYER_INVENTORY_SLOTS = 36;
@@ -612,7 +624,7 @@ public final class MarketFeed implements ClientModInitializer {
 
     // ---- tooltip and price helpers ---------------------------------------------------------
 
-    private static List<Component> tooltipLines(Minecraft client, ItemStack stack) {
+    static List<Component> tooltipLines(Minecraft client, ItemStack stack) {
         try {
             List<Component> tip = Screen.getTooltipFromItem(client, stack);
             return tip == null ? List.of() : tip;
@@ -621,7 +633,7 @@ public final class MarketFeed implements ClientModInitializer {
         }
     }
 
-    private static String joinLines(List<Component> lines, String separator) {
+    static String joinLines(List<Component> lines, String separator) {
         StringBuilder b = new StringBuilder(128);
         for (int i = 0, n = lines.size(); i < n; i++) {
             String line = lines.get(i).getString();

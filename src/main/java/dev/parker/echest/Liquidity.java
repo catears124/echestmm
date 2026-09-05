@@ -155,6 +155,22 @@ public final class Liquidity {
         if (listings == 0) return Regime.OPEN;
         return listings < THIN_BOOK_LISTINGS ? Regime.THIN : Regime.CROWDED;
     }
+    /**
+     * The lowest unit price worth listing at, given what the inventory actually cost.
+     *
+     * <p>A last-resort invariant, independent of every derived level. Calibration read from a
+     * poisoned history once produced {@code min sell 300} while the buy side was paying 350, and
+     * no amount of book-reading catches that: the book does not know our basis. This does.
+     *
+     * @param avgUnitCost realised average acquisition cost per item, or 0 when nothing is known
+     * @param minMarginPct the margin required over cost
+     */
+    public static long costFloor(long avgUnitCost, double minMarginPct) {
+        if (avgUnitCost <= 0) return 0;
+        double margin = Double.isFinite(minMarginPct) && minMarginPct > 0 ? minMarginPct : 0.0;
+        return (long) Math.ceil(avgUnitCost * (1.0 + margin));
+    }
+
 
     /**
      * The unit price to list at right now.

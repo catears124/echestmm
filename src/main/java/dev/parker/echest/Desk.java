@@ -34,6 +34,13 @@ public final class Desk {
     /** Below this many samples the derivation is not trustworthy and the ladder stays off. */
     public static final int MIN_SAMPLES = 20;
 
+    /**
+     * Beyond this IQR/median the samples are not one market.
+     *
+     * <p>Four times the median is already an extraordinarily wide book; the value that triggered
+     * this guard was fifty-four times.
+     */
+    public static final double MAX_COHERENT_DISPERSION = 4.0;
     /** Floor on the profit guard: never bid within this fraction of the resting ask. */
     private static final double MIN_SPREAD = 0.10;
     private static final double MAX_SPREAD = 0.45;
@@ -77,6 +84,19 @@ public final class Desk {
         long p75 = Liquidity.quantize(History.quantile(prices, 0.75), tick);
         long p90 = Liquidity.quantize(History.quantile(prices, 0.90), tick);
 
+
+        // A price series that spans two orders of magnitude is not one price series. The obsidian
+        // desk derived "p10 300 ... p90 38000, IQR/median 5425%" by mixing per-item buys with sale
+        // receipts logged before the unit fix, and concluded min sell 300 while the buy side was
+        // paying 350 - a desk configured to lose money on every trade. Incoherent history is worse
+        // than no history, so it is refused the same way too little history is.
+        if (median > 0 && (p75 - p25) > median * MAX_COHERENT_DISPERSION) {
+            return new Calibration(false, base, 0, 0, tick, base.liftMarginPct(), 0, n,
+                    "history spans " + p10 + " to " + p90 + " per item (IQR/median "
+                            + Math.round((p75 - p25) * 100.0 / median) + "%), which is two markets "
+                            + "and not one: refusing to derive levels from it. Pricing follows the "
+                            + "live book; run /echestmm forget to drop stale receipts.");
+        }
         double dispersion = median > 0 ? (p75 - p25) / (double) median : MIN_SPREAD;
         // The spread guard is a profit requirement, not a volatility measure. Feeding raw
         // dispersion into it put the bid ceiling 10 dollars above the start on a bimodal book.
