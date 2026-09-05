@@ -34,20 +34,24 @@ final class DeskCalibrationTest {
     }
 
     @Test
-    void parsesOnlyReceiptsForTheDeskItemAndUnitSize() {
+    void parsesReceiptsForTheDeskItemIntoPerItemPrices() {
         assertNull(History.parseReceipt("2026-09-05T08:00:00Z [receipt] BUY 64x Obsidian @ 20000",
                 "ender_chest", 1));
-        assertNull(History.parseReceipt("2026-09-05T08:00:00Z [receipt] BUY 1x Obsidian @ 400",
-                "obsidian", 64));
         // A LIST receipt is an intention, not a fill.
         assertNull(History.parseReceipt("2026-09-05T08:00:00Z [receipt] LIST 64x Obsidian @ 40000",
                 "obsidian", 64));
         assertNull(History.parseReceipt("2026-09-05T08:00:00Z [engine] listed at 40000", "obsidian", 64));
 
+        // A stack of 64 at 20,000 is 313 per item, and that is what a per-item model needs.
         long[] buy = History.parseReceipt("2026-09-05T08:00:00Z [receipt] BUY 64x Obsidian @ 20000",
                 "obsidian", 64);
         assertEquals(0, buy[0]);
-        assertEquals(20_000, buy[1]);
+        assertEquals(313, buy[1]);
+
+        // Lot size is a fact about the listing, not a filter: a single at 400 is 400 per item.
+        long[] single = History.parseReceipt("2026-09-05T08:00:00Z [receipt] BUY 1x Obsidian @ 400",
+                "obsidian", 64);
+        assertEquals(400, single[1]);
 
         long[] sell = History.parseReceipt(
                 "2026-09-05T08:46:23Z [receipt] SELL 1x Ender Chest @ 6200 (DillyBilly2000)",
@@ -56,21 +60,19 @@ final class DeskCalibrationTest {
         assertEquals(6_200, sell[1]);
     }
 
-
     @Test
-    void aSaleWithNoStatedQuantityCountsForAnyUnitSize() {
-        // Donut logs stack sales without a count: "X bought your Obsidian for $22K". Treating that
-        // as 1x made the 64-unit desk report "384 bought, 0 sold" and throw its own sales away.
+    void aSaleWithNoStatedQuantityAssumesTheDeskLotSize() {
+        // Donut logs stack sales without a count: "X bought your Obsidian for $22K". On a 64-stack
+        // desk that is 344 per item; reading it as 22,000 per item made the derived minimum sell
+        // price 20,000 per item - 1.28M a stack - which blocked every obsidian listing.
         long[] stackDesk = History.parseReceipt("x [receipt] SELL 0x Obsidian @ 22000", "obsidian", 64);
         assertEquals(1, stackDesk[0]);
-        assertEquals(22_000, stackDesk[1]);
+        assertEquals(344, stackDesk[1]);
 
         long[] unitDesk = History.parseReceipt("x [receipt] SELL 0x Obsidian @ 22000", "obsidian", 1);
         assertEquals(22_000, unitDesk[1]);
-
-        // An explicit count that disagrees with the desk is still rejected.
-        assertNull(History.parseReceipt("x [receipt] SELL 1x Obsidian @ 22000", "obsidian", 64));
     }
+
     @Test
     void separatesBoughtFromSoldPrices() {
         List<String> lines = List.of(
@@ -78,8 +80,8 @@ final class DeskCalibrationTest {
                 "x [receipt] SELL 64x Obsidian @ 40000",
                 "x [receipt] BUY 64x Obsidian @ 21000");
         History.Samples s = History.collect(lines, "minecraft:obsidian", 64, 500);
-        assertEquals(List.of(20_000L, 21_000L), s.bought());
-        assertEquals(List.of(40_000L), s.sold());
+        assertEquals(List.of(313L, 328L), s.bought());
+        assertEquals(List.of(625L), s.sold());
         assertEquals(3, s.size());
     }
 

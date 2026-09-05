@@ -3,6 +3,7 @@
   "package": "dev.parker.echest.mixin",
   "client": [
     "ClientPacketListenerMixin",
+    "AbstractContainerScreenMixin",
     "DialogScreenAccessor"
   ],
   "injectors": {

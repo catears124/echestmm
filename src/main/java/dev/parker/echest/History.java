@@ -44,30 +44,37 @@ public final class History {
             return out;
         }
     }
-
-    private History() {}
-
-    /** Parses one log line, or returns null. Package-private so the format itself is testable. */
-    static long[] parseReceipt(String line, String itemPath, int unitSize) {
+    /**
+     * Parses one log line into a realised <em>price per item</em>, or returns null.
+     *
+     * <p>Per item matters: the log records what the server said, and the server prices a listing,
+     * not an item. A stack of 64 obsidian at 22,000 is 344 per item, and feeding the 22,000
+     * straight into a per-item model made the derived minimum sell price 20,000 <em>per item</em> -
+     * 1.28M a stack - which silently blocked every obsidian listing.
+     *
+     * @param defaultUnits units to assume when the server states no quantity
+     */
+    static long[] parseReceipt(String line, String itemPath, int defaultUnits) {
         if (line == null) return null;
         Matcher m = RECEIPT.matcher(line);
         if (!m.find()) return null;
         String name = m.group(3).trim().toLowerCase(Locale.ROOT).replace(' ', '_');
         if (!name.equals(itemPath)) return null;
         int count;
-        long price;
+        long total;
         try {
             count = Integer.parseInt(m.group(2));
-            price = Long.parseLong(m.group(4));
+            total = Long.parseLong(m.group(4));
         } catch (NumberFormatException ignored) {
             return null;
         }
-        // count 0 means the server stated no quantity, so it cannot contradict the unit size.
-        if ((count != unitSize && count != 0) || price <= 0) return null;
+        if (total <= 0) return null;
+        int units = count > 0 ? count : Math.max(1, defaultUnits);
+        long perItem = Math.max(1L, Math.round(total / (double) units));
         // kind: 0 = bought, 1 = sold. A LIST is an intention, not a fill, so it is skipped.
         return switch (m.group(1)) {
-            case "BUY" -> new long[]{0, price};
-            case "SELL" -> new long[]{1, price};
+            case "BUY" -> new long[]{0, perItem};
+            case "SELL" -> new long[]{1, perItem};
             default -> null;
         };
     }

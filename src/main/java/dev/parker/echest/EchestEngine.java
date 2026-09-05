@@ -1050,14 +1050,26 @@ public final class EchestEngine {
     }
 
     /**
+     * A listing's price per item. The auction house grid applies to the <em>listing total</em>, so
+     * the per-item grid is that tick divided by the stack size: snapping per-item prices to the
+     * full 100 turned a 29,000 stack sale (453/item) into 400/item, a 12% error that also stopped
+     * sale receipts from matching our own listing tally.
+     */
+    private static long unitPriceOf(double totalPrice, int count) {
+        int units = Math.max(1, count);
+        long grid = Math.max(1, Math.max(1, cfg.tick()) / Math.max(1, unitSize));
+        long perItem = Math.max(1L, Math.round(totalPrice / units));
+        return Liquidity.quantize(perItem, grid);
+    }
+
+    /**
      * True when a command may be sent: no client screen open, and the server agrees no container
      * is open.
      *
      * <p>Those two can disagree. The measured failure was two stalls of 238 s and 258 s spent
-     * logging "a server-side container is still open" while nothing broke the deadlock: the client
-     * screen was gone, so nothing sent a close packet, and the server kept the container open
-     * forever. A close packet is therefore forced after {@code CONTAINER_STALL_MS}, and the state
-     * machine gives up rather than spinning if the server ignores several of them.
+     * logging "a server-side container is still open" while nothing broke the deadlock, so a close
+     * packet is forced after {@code CONTAINER_STALL_MS} and the state machine gives up rather than
+     * spinning if the server ignores several of them.
      */
     private static boolean readyForCommand(LocalPlayer player, InventoryMenu inv, Screen screen) {
         if (screen != null) { closeScreen(player, screen); cooldown = 3; return false; }
@@ -1147,12 +1159,6 @@ public final class EchestEngine {
             }
         }
         liveListings.removeIf(live -> !ownPriceCounts.containsKey(live.price));
-    }
-
-    /** A listing's price per item, on the grid. Mixed stack sizes are only comparable this way. */
-    private static long unitPriceOf(double totalPrice, int count) {
-        int units = Math.max(1, count);
-        return Liquidity.quantize(Math.round(totalPrice / units), Math.max(1, cfg.tick()));
     }
 
     /**
@@ -1508,11 +1514,11 @@ public final class EchestEngine {
         }
         if (findHotbarUnit(inv) < 0) {
             String have = partial >= 0 ? "only partial stacks of " + itemId : "no " + itemId;
-            if (acquiring) {
-                // Nothing to list, but the buy side still has work. Leaving PREPARE_SELL matters:
-                // returning false from here re-entered the state every tick and traced 16 times a
-                // second for as long as the desk had no stock.
-                setState(State.WAIT_FULL, have + " to list; the bid ladder keeps working");
+            if (acquiring || squeezing) {
+                // Out of stock is not out of work: the buy side still has to acquire (or sweep).
+                // Switching the whole engine off here is what ended the obsidian run after a
+                // single dispatch, and it also spun this state at 16 traces a second before that.
+                setState(State.WAIT_FULL, have + " to list; the buy side keeps working");
                 return false;
             }
             stop(player::sendSystemMessage, have + " left to list");

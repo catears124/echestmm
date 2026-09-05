@@ -1,6 +1,7 @@
 package dev.parker.echest;
 
 import com.mojang.brigadier.Command;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import dev.parker.echest.mixin.DialogScreenAccessor;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
@@ -42,6 +43,7 @@ import java.util.regex.Pattern;
 
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.literal;
 
+import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.argument;
 /**
  * Passive extraction layer: reads the DonutSMP auction house out of the client's already
  * synchronized container menus, the server-supplied confirmation dialogs, and server chat. This
@@ -198,9 +200,25 @@ public final class MarketFeed implements ClientModInitializer {
                                     "[EchestMM] last Your Items read: " + lastOwnLayout));
                             return Command.SINGLE_SUCCESS;
                         }))
+                        .then(literal("record")
+                                .then(literal("on").executes(ctx -> {
+                                    ctx.getSource().sendFeedback(Component.literal("[EchestMM] " + FlowRecorder.start()));
+                                    return Command.SINGLE_SUCCESS;
+                                }))
+                                .then(literal("off").executes(ctx -> {
+                                    ctx.getSource().sendFeedback(Component.literal("[EchestMM] " + FlowRecorder.stop()));
+                                    return Command.SINGLE_SUCCESS;
+                                })))
+                        .then(literal("mark").then(argument("text", StringArgumentType.greedyString())
+                                .executes(ctx -> {
+                                    ctx.getSource().sendFeedback(Component.literal("[EchestMM] "
+                                            + FlowRecorder.mark(StringArgumentType.getString(ctx, "text"))));
+                                    return Command.SINGLE_SUCCESS;
+                                })))
                 )
         );
 
+        FlowRecorder.init();
         EchestEngine.init();
     }
 
