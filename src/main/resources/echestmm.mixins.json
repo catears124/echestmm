@@ -1,0 +1,11 @@
+{
+  "required": false,
+  "package": "dev.parker.echest.mixin",
+  "client": [
+    "ClientPacketListenerMixin",
+    "DialogScreenAccessor"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

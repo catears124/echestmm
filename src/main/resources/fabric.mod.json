@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "echestmm",
+  "version": "${version}",
+  "name": "EchestMM",
+  "description": "DonutSMP ender chest market maker: liquidity-priced single-unit dumping, cheap-listing sniping, and floor lifting.",
+  "authors": ["Parker"],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.parker.echest.MarketFeed"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": "26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  },
+  "mixins": ["echestmm.mixins.json"]
+}
