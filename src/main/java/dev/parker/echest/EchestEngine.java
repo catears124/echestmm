@@ -1632,34 +1632,46 @@ public final class EchestEngine {
     /**
      * What a swept item can actually be resold for.
      *
-     * <p>Not simply the current quote. The obsidian book was read at floor 1250/item on an evening
-     * when realised sales were nearer 470, and a sweep priced off that floor would have paid
-     * ~1060/item for stock worth half of it - buying someone else's optimism with real money.
+     * <p>Not the live sell quote. That quote is <em>defined</em> as one grid step under the
+     * current floor - useful for listing right now, useless as a buy ceiling, because it sits
+     * almost exactly where the ask we are trying to buy already is. Subtracting a real profit
+     * margin from a number that close to the floor produces a ceiling below the floor on any
+     * book with real depth, which is most of them: obsidian sat refusing to buy 413/item asks
+     * against a "resale anchor" of 412 for thirty straight minutes, every single time, because
+     * 412 was arithmetically defined as 413 minus one dollar.
      *
-     * <p>So the resale price used for buying is the lower of what the book says we could ask and
-     * what we have actually been paid. With no realised sales and no calibration there is no
-     * evidenced resale price at all, and the honest answer is to refuse the sweep rather than
-     * invent one: {@code 0} means "sell something first".
+     * <p>What a sweep should be priced against is what we could sell for <em>after</em> the sweep
+     * clears the cheap tail - and the desk already derives exactly that number from evidence:
+     * {@link Desk.Calibration}'s {@code fallbackPrice} is p90 of every realised trade, a level the
+     * book has demonstrably cleared before, guarded against incoherent history by
+     * {@link Desk#MAX_COHERENT_DISPERSION} and a {@value Desk#MIN_SAMPLES}-trade minimum. That is
+     * real evidence about achievable resale value; the live undercut-quote never was.
+     *
+     * <p>The book quote still matters as a floor under the anchor - never resell for less than we
+     * could get by simply undercutting right now - and a cap against our own realised sale median
+     * still guards against a calibration skewed by a handful of outlier sales, the same failure
+     * mode a listing at $473,600 came from originally.
      */
     private static long sweepResaleAsk(Liquidity.Quote quote) {
         long booked = quote == null ? 0 : quote.unitPrice();
-        if (booked <= 0) return 0;   // no comparable lots: nothing defensible to price against
 
-        // A quote built from lots of our own size is real evidence - it is the price stacks are
-        // actually listed at. The earlier version demanded realised sales from the current session
-        // instead, which a desk switch deliberately wipes, so the obsidian desk could never
-        // satisfy it and quietly stopped buying at all.
-        //
-        // Persisted receipts still hold a veto, because a thin book can be optimistic: if we have
-        // ever really sold this item, a sweep will not price above a multiple of what we were paid.
+        long anchor = booked;
+        if (lastCalibration != null && lastCalibration.ladderReady()) {
+            long evidenced = lastCalibration.cfg().fallbackPrice();
+            anchor = Math.max(anchor, evidenced);
+        }
+        if (anchor <= 0) return 0;   // no comparable lots and no calibration: nothing to price against
+
+        // Persisted receipts still hold a veto: if we have ever really sold this item, a sweep will
+        // not price above a multiple of what we were actually paid, calibration or not.
         long realised = realisedSaleHistory();
-        if (realised > 0 && booked > realised * RESALE_OPTIMISM_LIMIT) {
+        if (realised > 0 && anchor > realised * RESALE_OPTIMISM_LIMIT) {
             long capped = realised * RESALE_OPTIMISM_LIMIT;
-            trace("resale anchor capped at " + capped + "/item: the book asks " + booked
+            trace("resale anchor capped at " + capped + "/item: evidence suggested " + anchor
                     + " but we have only ever been paid around " + realised);
             return capped;
         }
-        return booked;
+        return anchor;
     }
 
     /**
@@ -1812,6 +1824,12 @@ public final class EchestEngine {
         if (ordering && !OrderFlow.busy()) {
             long nowMs = System.currentTimeMillis();
             if (nowMs - lastOrderMs >= ORDER_REPLAN_MS) {
+                // The replan cadence must hold on a refusal too, not only a success. Advancing
+                // lastOrderMs only inside sweep.go() meant a refused sweep re-entered this branch
+                // on literally every tick planBuy() ran - hundreds of identical "refused" lines a
+                // second, all saying the same thing, drowning the log this fix exists to keep
+                // readable.
+                lastOrderMs = nowMs;
                 int heldUnits = countInventory(Minecraft.getInstance());
                 int roomUnits = maxHoldUnits > 0
                         ? Math.max(0, maxHoldUnits * Math.max(1, unitSize) - heldUnits)
@@ -1827,7 +1845,6 @@ public final class EchestEngine {
                 }
                 lastSweep = sweep;
                 if (sweep.go()) {
-                    lastOrderMs = nowMs;
                     buyReason = "order sweep: " + sweep.reason();
                     trace(buyReason);
                     OrderFlow.place(itemId, deskItemName(), sweep.units(), sweep.ceilingPrice());
