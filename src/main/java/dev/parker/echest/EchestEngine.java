@@ -76,6 +76,8 @@ public final class EchestEngine {
     private static final int MARKET_RECHECK_TICKS = 600;
     /** With no stock, how often the book is re-read so a sweep is priced on current data. */
     private static final int MARKET_REFRESH_WHILE_EMPTY_TICKS = 100;
+    /** How far above realised sale prices a book quote may be trusted as a resale anchor. */
+    private static final long RESALE_OPTIMISM_LIMIT = 3L;
     /** Price levels printed by {@code /echestmm book}. */
     private static final int BOOK_LADDER_LINES = 12;
     private static final int OWN_REREAD_EVERY = 25;
@@ -1604,15 +1606,37 @@ public final class EchestEngine {
      */
     private static long sweepResaleAsk(Liquidity.Quote quote) {
         long booked = quote == null ? 0 : quote.unitPrice();
-        long realised = realisedSaleMedian();
-        if (realised > 0 && booked > 0) return Math.min(booked, realised);
-        if (realised > 0) return realised;
-        // No fills of our own yet: a calibrated desk has a median to lean on, an uncalibrated one
-        // has nothing, and guessing from a thin book is how you overpay.
-        if (lastCalibration != null && lastCalibration.ladderReady()) {
-            return Math.min(booked, Math.max(1L, lastCalibration.bidCeiling()));
+        if (booked <= 0) return 0;   // no comparable lots: nothing defensible to price against
+
+        // A quote built from lots of our own size is real evidence - it is the price stacks are
+        // actually listed at. The earlier version demanded realised sales from the current session
+        // instead, which a desk switch deliberately wipes, so the obsidian desk could never
+        // satisfy it and quietly stopped buying at all.
+        //
+        // Persisted receipts still hold a veto, because a thin book can be optimistic: if we have
+        // ever really sold this item, a sweep will not price above a multiple of what we were paid.
+        long realised = realisedSaleHistory();
+        if (realised > 0 && booked > realised * RESALE_OPTIMISM_LIMIT) {
+            long capped = realised * RESALE_OPTIMISM_LIMIT;
+            trace("resale anchor capped at " + capped + "/item: the book asks " + booked
+                    + " but we have only ever been paid around " + realised);
+            return capped;
         }
-        return 0;
+        return booked;
+    }
+
+    /**
+     * Median per-item price we have really been paid for this item, across every session.
+     *
+     * <p>Read from the receipt log, not from session counters. Counters are cleared on a desk
+     * switch - correctly, since a clearing rate belongs to one desk - but realised prices are
+     * durable evidence, and clearing them left the buy side with nothing to reason from.
+     */
+    private static long realisedSaleHistory() {
+        History.Samples samples = History.load(itemId, unitSize, 200);
+        if (samples == null || samples.sold().isEmpty()) return 0;
+        long median = History.quantile(samples.sold(), 0.50);
+        return median > 0 && median != Long.MIN_VALUE ? median : 0;
     }
 
     /** Realised average unit price of our own sales; the only resale evidence that is ours. */

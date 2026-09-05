@@ -71,9 +71,33 @@ public final class Liquidity {
             return new Config(100, 25_000, 100, 900.0, 500, 0.15, 0.25, 12, 0.20);
         }
 
-        /** One tick under a competing level, snapped down onto the grid. */
+        /** One tick under a competing level, snapped down onto the grid. Single-unit lots. */
         public long undercut(long level) {
-            return quantize(level - tick, tick);
+            return undercut(level, 1);
+        }
+
+        /**
+         * One grid step under a competing level, in per-item space.
+         *
+         * <p>{@link #tick} is the grid the auction house applies to the <em>listing total</em>, so
+         * on a 64-stack desk one step is {@code 100/64} of a dollar per item. Subtracting a whole
+         * tick per item instead took $6,400 off every stack: with the book at 391/item the desk
+         * listed at 291/item, selling stacks for 19,000 while 25,000 was on the screen. A 24%
+         * discount, from a units mismatch rather than any decision.
+         */
+        public long undercut(long level, int unitSize) {
+            long grid = perItemGrid(unitSize);
+            return quantize(level - grid, grid);
+        }
+
+        /** The price grid in per-item space: the listing-total tick divided by the lot size. */
+        public long perItemGrid(int unitSize) {
+            return Math.max(1, tick / Math.max(1, unitSize));
+        }
+
+        /** The discovery probe step in per-item space, for the same reason. */
+        public long perItemLadderStep(int unitSize) {
+            return Math.max(perItemGrid(unitSize), ladderStep / Math.max(1, unitSize));
         }
     }
 
@@ -223,7 +247,7 @@ public final class Liquidity {
 
         long floor = book.getFirst().unitPrice();
         if (!Double.isFinite(clearRate) || clearRate <= 0.0) {
-            long wanted = cfg.undercut(floor);
+            long wanted = cfg.undercut(floor, unitSize);
             long price = Math.max(cfg.minPrice, wanted);
             // Say which price is actually being listed. This branch used to report "undercutting
             // floor 5900" while the minimum silently raised the listing to 6100, so the log
@@ -237,13 +261,14 @@ public final class Liquidity {
 
         List<Long> candidates = new ArrayList<>(book.size() + 1);
         for (Level l : book) {
-            long p = cfg.undercut(l.unitPrice);
+            long p = cfg.undercut(l.unitPrice, unitSize);
             if (p >= cfg.minPrice) candidates.add(p);
         }
-        long above = quantize(book.getLast().unitPrice + cfg.ladderStep, cfg.tick);
+        long grid = cfg.perItemGrid(unitSize);
+        long above = quantize(book.getLast().unitPrice + cfg.perItemLadderStep(unitSize), grid);
         if (above >= cfg.minPrice) candidates.add(above);
         if (candidates.isEmpty()) {
-            long price = Math.max(cfg.minPrice, quantize(cfg.minPrice, cfg.tick));
+            long price = Math.max(cfg.minPrice, quantize(cfg.minPrice, cfg.perItemGrid(unitSize)));
             return new Quote(price, queueAhead(book, ownUnitPrices, price), Double.NaN, Double.NaN,
                     "every undercut price is below the minimum; listing at the minimum");
         }
