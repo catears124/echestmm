@@ -62,7 +62,8 @@ public final class History {
         } catch (NumberFormatException ignored) {
             return null;
         }
-        if (count != unitSize || price <= 0) return null;
+        // count 0 means the server stated no quantity, so it cannot contradict the unit size.
+        if ((count != unitSize && count != 0) || price <= 0) return null;
         // kind: 0 = bought, 1 = sold. A LIST is an intention, not a fill, so it is skipped.
         return switch (m.group(1)) {
             case "BUY" -> new long[]{0, price};

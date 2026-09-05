@@ -556,7 +556,10 @@ public final class MarketFeed implements ClientModInitializer {
         }
         Matcher sold = SELL_RECEIPT.matcher(text);
         if (sold.find()) {
-            int count = sold.group(2) == null || sold.group(2).isBlank() ? 1 : Integer.parseInt(sold.group(2));
+            // Donut's sale line often omits the quantity ("X bought your Obsidian for $22K").
+            // Reporting that as 1 made a 64-unit stack desk discard its own sold-side history, so
+            // an absent count is recorded as 0, meaning "unspecified", not "one".
+            int count = sold.group(2) == null || sold.group(2).isBlank() ? 0 : Integer.parseInt(sold.group(2));
             emitReceipt(new Receipt(now, "SELL", sold.group(1).trim(), normalizeItemName(sold.group(3)),
                     count, compactNumber(sold.group(4), sold.group(5)), text));
             return;

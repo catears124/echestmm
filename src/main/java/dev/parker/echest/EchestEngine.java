@@ -12,6 +12,7 @@ import net.minecraft.client.gui.components.AbstractButton;
 import net.minecraft.client.gui.components.events.ContainerEventHandler;
 import net.minecraft.client.gui.components.events.GuiEventListener;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.DisconnectedScreen;
 import net.minecraft.client.gui.screens.dialog.DialogScreen;
 import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.player.LocalPlayer;
@@ -76,6 +77,11 @@ public final class EchestEngine {
 
     private static final Pattern BALANCE = Pattern.compile(
             "(?i)balance[^0-9$]{0,16}\\$?\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kmbt]?)");
+    /** How long a server-side container may stay open before a close packet is forced. */
+    private static final long CONTAINER_STALL_MS = 3_000L;
+    private static final int MAX_CONTAINER_CLOSE_ATTEMPTS = 3;
+    /** Ticks allowed for a disconnect to reveal itself as involuntary. */
+    private static final long DISCONNECT_CLASSIFY_TICKS = 60L;
 
     enum State {
         OFF, PAUSED,
@@ -162,22 +168,51 @@ public final class EchestEngine {
     private static Liquidity.Quote lastQuote;
     private static Liquidity.LiftPlan lastLift = Liquidity.LiftPlan.no("not evaluated");
     private static Liquidity.BidPlan lastBid = new Liquidity.BidPlan(false, 0, "not evaluated");
+    private static long containerStuckSinceMs;
+    private static int containerCloseAttempts;
+
+    private static long disconnectCheckUntilTick;
 
     private EchestEngine() {}
 
     static void init() {
         ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::tick);
+        // Runs even when the engine is off, so a disconnect can be classified after the fact.
+        ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::checkDisconnectCause);
         MarketFeed.onReceipt(EchestEngine::onReceipt);
         MarketFeed.onMessage(EchestEngine::onMessage);
-        // A kick arrives as a plain disconnect with no warning line, so the disconnect itself is
-        // the signal. Penalise the persistent ceiling before the next session can repeat it.
+        // A kick arrives with no warning line, so the disconnect itself has to be the signal.
+        // But quitting the game is also a disconnect: penalising that dropped the ceiling to
+        // 0.55/s for no reason. The cause is therefore classified on the following ticks - an
+        // involuntary disconnect leaves a DisconnectedScreen up, a deliberate quit does not.
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-            if (state == State.OFF || state == State.PAUSED) return;
-            ActionPacer.penalize(System.currentTimeMillis(), "disconnected while trading");
+            boolean wasTrading = state != State.OFF && state != State.PAUSED;
             state = State.OFF;
             queue.clear();
+            containerStuckSinceMs = 0L;
+            containerCloseAttempts = 0;
+            if (wasTrading) disconnectCheckUntilTick = ticks + DISCONNECT_CLASSIFY_TICKS;
         });
         registerCommands();
+    }
+
+    /**
+     * Classifies a recent disconnect. A kick or a lost connection leaves Minecraft showing a
+     * {@link DisconnectedScreen}; quitting to the title screen or closing the game does not.
+     * Only the involuntary case ratchets the pacing ceiling down.
+     */
+    private static void checkDisconnectCause(Minecraft client) {
+        if (disconnectCheckUntilTick <= 0) return;
+        Screen screen = client.gui.screen();
+        if (screen instanceof DisconnectedScreen) {
+            disconnectCheckUntilTick = 0;
+            ActionPacer.penalize(System.currentTimeMillis(), "kicked or dropped while trading");
+            return;
+        }
+        if (ticks >= disconnectCheckUntilTick) {
+            disconnectCheckUntilTick = 0;
+            MarketFeed.log("pacer", "disconnect looked deliberate (no disconnect screen); ceiling unchanged");
+        }
     }
 
     // ---- commands --------------------------------------------------------------------------
@@ -192,6 +227,10 @@ public final class EchestEngine {
                         })
                         .then(literal("status").executes(ctx -> feedback(ctx.getSource()::sendFeedback, status())))
                         .then(literal("pace").executes(ctx -> feedback(ctx.getSource()::sendFeedback, pacing())))
+                        .then(literal("pacereset").executes(ctx -> {
+                            ActionPacer.reset(System.currentTimeMillis(), "manual reset");
+                            return feedback(ctx.getSource()::sendFeedback, pacing());
+                        }))
                         .then(literal("calibrate").executes(ctx ->
                                 feedback(ctx.getSource()::sendFeedback, calibrate())))
                         .then(literal("debug").executes(ctx -> {
@@ -459,7 +498,7 @@ public final class EchestEngine {
         switch (r.kind()) {
             case "LIST" -> {
                 if (state != State.WAIT_CONFIRM && state != State.WAIT_SOLD) return;
-                if (r.count() != unitSize) {
+                if (r.count() != unitSize && r.count() != 0) {
                     LocalPlayer p = Minecraft.getInstance().player;
                     if (p != null) {
                         pause(p, "server listed " + r.count() + " items but the unit is " + unitSize
@@ -844,7 +883,9 @@ public final class EchestEngine {
                             + ", unit=" + unitSize + ")");
                     return;
                 }
-                if (!readyForCommand(player, inv, null)) return;
+                // Passing the live screen matters: with null, an open GUI was never closed and the
+                // engine waited on a container it was refusing to shut.
+                if (!readyForCommand(player, inv, screen)) return;
                 listReceiptSeen = false;
                 if (!sendCommand(client, "ah sell " + currentPrice)) return;
                 setState(State.WAIT_CONFIRM, "sent /ah sell " + currentPrice);
@@ -867,12 +908,39 @@ public final class EchestEngine {
         }
     }
 
+    /**
+     * True when a command may be sent: no client screen open, and the server agrees no container
+     * is open.
+     *
+     * <p>Those two can disagree. The measured failure was two stalls of 238 s and 258 s spent
+     * logging "a server-side container is still open" while nothing broke the deadlock: the client
+     * screen was gone, so nothing sent a close packet, and the server kept the container open
+     * forever. A close packet is therefore forced after {@code CONTAINER_STALL_MS}, and the state
+     * machine gives up rather than spinning if the server ignores several of them.
+     */
     private static boolean readyForCommand(LocalPlayer player, InventoryMenu inv, Screen screen) {
         if (screen != null) { closeScreen(player, screen); cooldown = 3; return false; }
         if (player.containerMenu != inv) {
-            if (++waited % 40 == 0) trace("waiting: a server-side container is still open");
+            long nowMs = System.currentTimeMillis();
+            if (containerStuckSinceMs == 0L) containerStuckSinceMs = nowMs;
+            long stalledMs = nowMs - containerStuckSinceMs;
+            if (stalledMs >= CONTAINER_STALL_MS) {
+                if (++containerCloseAttempts > MAX_CONTAINER_CLOSE_ATTEMPTS) {
+                    containerStuckSinceMs = 0L;
+                    containerCloseAttempts = 0;
+                    retryOrPause(player, null, "server kept a container open for "
+                            + stalledMs / 1000 + "s despite " + MAX_CONTAINER_CLOSE_ATTEMPTS + " close packets");
+                    return false;
+                }
+                containerStuckSinceMs = nowMs;
+                trace("container stuck for " + stalledMs / 1000 + "s; forcing a close packet ("
+                        + containerCloseAttempts + "/" + MAX_CONTAINER_CLOSE_ATTEMPTS + ")");
+                if (ActionPacer.charge(nowMs, 1.0)) player.closeContainer();
+            }
             return false;
         }
+        containerStuckSinceMs = 0L;
+        containerCloseAttempts = 0;
         return true;
     }
 

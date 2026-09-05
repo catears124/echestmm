@@ -120,6 +120,23 @@ public final class ActionPacer {
                 + "/s, penalties=" + penalties);
     }
 
+    /**
+     * Clears the recorded penalties and returns to the default ceiling. For the case where the
+     * ratchet fired on something that was not a kick - the first version penalised a deliberate
+     * quit, which cost 0.35/s of throughput for nothing.
+     */
+    public static synchronized void reset(long nowMs, String reason) {
+        ensureLoaded();
+        double before = cap;
+        cap = DEFAULT_CAP;
+        penalties = 0;
+        tokens = 0.0;
+        cleanSinceMs = nowMs;
+        lastRefillMs = nowMs;
+        save();
+        MarketFeed.log("pacer", "reset (" + reason + "): cap " + fmt(before) + " -> " + fmt(cap) + "/s");
+    }
+
     /** Restarts the clean-uptime clock, e.g. when trading is switched on. */
     public static synchronized void noteResumed(long nowMs) {
         ensureLoaded();

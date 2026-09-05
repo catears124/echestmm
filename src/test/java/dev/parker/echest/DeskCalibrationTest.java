@@ -56,6 +56,21 @@ final class DeskCalibrationTest {
         assertEquals(6_200, sell[1]);
     }
 
+
+    @Test
+    void aSaleWithNoStatedQuantityCountsForAnyUnitSize() {
+        // Donut logs stack sales without a count: "X bought your Obsidian for $22K". Treating that
+        // as 1x made the 64-unit desk report "384 bought, 0 sold" and throw its own sales away.
+        long[] stackDesk = History.parseReceipt("x [receipt] SELL 0x Obsidian @ 22000", "obsidian", 64);
+        assertEquals(1, stackDesk[0]);
+        assertEquals(22_000, stackDesk[1]);
+
+        long[] unitDesk = History.parseReceipt("x [receipt] SELL 0x Obsidian @ 22000", "obsidian", 1);
+        assertEquals(22_000, unitDesk[1]);
+
+        // An explicit count that disagrees with the desk is still rejected.
+        assertNull(History.parseReceipt("x [receipt] SELL 1x Obsidian @ 22000", "obsidian", 64));
+    }
     @Test
     void separatesBoughtFromSoldPrices() {
         List<String> lines = List.of(
