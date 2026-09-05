@@ -108,8 +108,9 @@ public final class EchestEngine {
     /** Weight charged for one inventory shuffling click; three of them cost one interaction. */
     private static final double CLICK_WEIGHT = 0.34;
 
+    /** Extracts the amount from "You have $ 17,567,146" - the real text, not a guessed one. */
     private static final Pattern BALANCE = Pattern.compile(
-            "(?i)balance[^0-9$]{0,16}\\$?\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kmbt]?)");
+            "(?i)\\byou\\s+have\\s*\\$\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kmbt]?)\\b");
     /** How long a server-side container may stay open before a close packet is forced. */
     private static final long CONTAINER_STALL_MS = 3_000L;
     private static final int MAX_CONTAINER_CLOSE_ATTEMPTS = 3;

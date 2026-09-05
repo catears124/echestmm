@@ -158,9 +158,17 @@ public final class MarketFeed implements ClientModInitializer {
     /** Donut's reply to {@code /ah sell} when every listing slot is taken. */
     private static final Pattern AH_FULL = Pattern.compile("(?i)too\\s+many\\s+listed\\s+items");
     private static final Pattern NOT_ENOUGH_MONEY = Pattern.compile("(?i)(not\\s+enough\\s+money|can(?:no|')t\\s+afford)");
-    /** Donut's {@code /bal} reply, used as the cash budget for sniping and floor lifts. */
+    /**
+     * Donut's {@code /bal} reply, used as the cash budget for sniping and floor lifts.
+     *
+     * <p>The actual text, captured by the raw {@code [chat]} log added specifically to answer this
+     * question: {@code "You have $ 17,567,146"}. No word "balance" appears anywhere in it - the
+     * previous pattern required one and so never matched a single reply, ever, in this mod's whole
+     * history. The dollar sign right after "you have" is what disambiguates this from unrelated
+     * lines like "You have too many listed items", which carries no amount.
+     */
     private static final Pattern BALANCE_LINE = Pattern.compile(
-            "(?i)balance[^0-9$]{0,16}\\$?\\s*[0-9][0-9,]*(?:\\.[0-9]+)?\\s*[kmbt]?");
+            "(?i)\\byou\\s+have\\s*\\$\\s*[0-9][0-9,]*(?:\\.[0-9]+)?\\s*[kmbt]?\\b");
     /** Buy-order lifecycle, as recorded: "You ordered 2.5K Obsidian", "…order is complete!". */
     private static final Pattern ORDER_PLACED = Pattern.compile("(?i)\\byou\\s+ordered\\b");
     private static final Pattern ORDER_COMPLETE = Pattern.compile("(?i)order\\s+is\\s+complete");
