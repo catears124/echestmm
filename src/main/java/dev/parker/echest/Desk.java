@@ -41,6 +41,14 @@ public final class Desk {
      * this guard was fifty-four times.
      */
     public static final double MAX_COHERENT_DISPERSION = 4.0;
+    /**
+     * How far under the median the listing minimum sits.
+     *
+     * <p>A quarter of the median is unreachable in normal trading - the book would have to
+     * collapse to a fraction of its own range before this binds - which is the point. It exists
+     * to catch a mispricing, not to set policy.
+     */
+    private static final double MIN_SELL_FRACTION_OF_MEDIAN = 0.25;
     /** Floor on the profit guard: never bid within this fraction of the resting ask. */
     private static final double MIN_SPREAD = 0.10;
     private static final double MAX_SPREAD = 0.45;
@@ -110,7 +118,18 @@ public final class Desk {
         // ladder at all; the median is a level the book demonstrably trades through.
         long ceiling = Math.max(bidStart + tick, median);
         long step = Math.max(tick, Liquidity.quantize(Math.max(tick, (ceiling - bidStart) / 12), tick));
-        long minPrice = Math.max(tick, p25);
+        // The listing minimum is a loss guard, not a memory of what we used to get.
+        //
+        // This was p25 of our own realised sales, which is circular: 500 echest fills put the
+        // floor at 6,100, so a book floor of 5,900 could not be undercut, every listing joined the
+        // back of the queue, fills slowed, and the slow fills fed the next calibration. A desk
+        // must be free to compete at whatever price the market is at today.
+        //
+        // What the minimum is actually for is refusing to give inventory away - so it sits far
+        // below the trading range, where only a genuine mispricing can reach it. The revenue-rate
+        // optimiser picks the price; the cost floor defends the basis; this catches absurdity.
+        long minPrice = Math.max(tick, Liquidity.quantize(
+                (long) Math.floor(median * MIN_SELL_FRACTION_OF_MEDIAN), tick));
         long emptyBookAsk = Math.max(minPrice, p90);
 
         int holdUnits = 0;

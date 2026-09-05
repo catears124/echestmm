@@ -565,7 +565,7 @@ public final class EchestEngine {
                 return "unknown desk \"" + name + "\"; use echest or obsidian";
             }
         }
-        currentBid = 0;
+        resetDeskState();
         invalidateCaches();
         return "desk " + name + ": " + itemId + " x" + unitSize + " per listing. " + calibrate();
     }
@@ -575,7 +575,11 @@ public final class EchestEngine {
      * switch and by {@code /echestmm calibrate}; safe to run mid-session.
      */
     private static String calibrate() {
-        Liquidity.Config base = cfg.tick() > 0 ? cfg : Liquidity.Config.defaults();
+        // Always from clean defaults, never from whatever the last desk derived. Carrying the
+        // ender chest configuration into the obsidian desk imported a listing minimum an order of
+        // magnitude too high, which filtered out every sane undercut candidate and left only the
+        // absurd end of the book to choose from.
+        Liquidity.Config base = Liquidity.Config.defaults();
         History.Samples samples = History.load(itemId, unitSize, 500);
         Desk.Calibration cal = Desk.derive(samples, cash, base);
         cfg = cal.cfg();
@@ -696,6 +700,43 @@ public final class EchestEngine {
         salesSinceOwnRead = 0;
     }
 
+    /**
+     * Forgets everything measured about the previous desk.
+     *
+     * <p>Two different items do not share a clearing rate, a basis, or a book. Without this the
+     * obsidian desk borrowed the ender chest desk's 5.192 units/s, decided a 22-deep queue would
+     * clear in four seconds, and listed a stack of obsidian at $473,600 - a price only the
+     * aspirational top half of that book agreed with. Measurements belong to the desk that made
+     * them.
+     */
+    private static void resetDeskState() {
+        fills.clear();
+        clearRate = Double.NaN;
+        ownPriceCounts.clear();
+        liveListings.clear();
+        marketUnits.clear();
+        listed = 0;
+        sold = 0;
+        grossSold = 0;
+        bought = 0;
+        grossBought = 0;
+        acquired = 0;
+        acquiredCost = 0;
+        orderedItems = 0;
+        orderedCost = 0;
+        discoveredAsk = 0;
+        currentBid = 0;
+        squeeze = null;
+        squeezeUntilMs = 0L;
+        lastQuote = null;
+        lastCalibration = null;
+        lastSweep = Sweep.Plan.no("not evaluated");
+        lastOrderMs = 0L;
+        lastFillAtMs = 0L;
+        lastProbeMs = 0L;
+        lastProbeFilled = false;
+    }
+
     private static void setState(State next, String why) {
         if (state == next) return;
         trace(state + " -> " + next + (why == null || why.isEmpty() ? "" : "  (" + why + ")"));
@@ -707,6 +748,7 @@ public final class EchestEngine {
     private static void trace(String msg) {
         MarketFeed.log("engine", msg);
         if (!debug) return;
+
         LocalPlayer p = Minecraft.getInstance().player;
         if (p != null) p.sendSystemMessage(Component.literal("\u00a77[EchestMM] " + msg));
     }
@@ -1415,7 +1457,7 @@ public final class EchestEngine {
         }
         discoveredAsk = 0;   // a real book is in front of us again; discovery restarts from it
         return atCostFloor(Liquidity.quote(levels, new ArrayList<>(ownPriceCounts.keySet()),
-                clearRate, cfg));
+                clearRate, unitSize, cfg));
     }
 
     /**

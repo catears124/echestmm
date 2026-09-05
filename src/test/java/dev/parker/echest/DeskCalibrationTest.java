@@ -115,7 +115,11 @@ final class DeskCalibrationTest {
         long p90 = Liquidity.quantize(History.quantile(s.all(), 0.90), 100);
 
         assertEquals(p10, cal.bidStart());                     // ladder starts at the cheap end
-        assertEquals(p25, cal.cfg().minPrice());               // evidence-based sell floor
+        // The sell floor is a loss guard, not a memory of past prices: it must stay clear of the
+        // cheap end of the range so the desk can still undercut a falling book. Pinning it at p25
+        // is what stopped 500-fill echest desks from ever listing under 6,100.
+        assertTrue(cal.cfg().minPrice() < p10,
+                "sell floor " + cal.cfg().minPrice() + " must sit below p10 " + p10);
         assertEquals(p90, cal.cfg().fallbackPrice());          // empty-book ask
         assertTrue(cal.bidStep() >= 100);
         assertEquals(0, cal.bidStep() % 100);                  // on the grid

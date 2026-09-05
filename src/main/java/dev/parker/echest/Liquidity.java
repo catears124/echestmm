@@ -64,7 +64,11 @@ public final class Liquidity {
             double maxCashSharePct  // never spend more than this share of liquid cash on a lift
     ) {
         public static Config defaults() {
-            return new Config(1_000, 25_000, 100, 900.0, 500, 0.15, 0.25, 12, 0.20);
+            // The listing minimum defaults to the price grid itself, not to a guess. Anything
+            // higher is a policy claim about an item we have no evidence about yet, and a
+            // 1,000/item default silently deleted every sane candidate on a book whose floor was
+            // 1,000/item - leaving only the aspirational end to choose from.
+            return new Config(100, 25_000, 100, 900.0, 500, 0.15, 0.25, 12, 0.20);
         }
 
         /** One tick under a competing level, snapped down onto the grid. */
@@ -129,6 +133,33 @@ public final class Liquidity {
     }
 
     /**
+     * Units of competing supply priced under {@code unitPrice}: the depth that must clear first.
+     *
+     * <p>Distinct from {@link #queueAhead}, which counts listings, and the distinction is not
+     * cosmetic. Expected wait is depth divided by a clearing rate measured in units per second, so
+     * counting listings understated the wait by the stack size - 64x on the obsidian desk. Twenty-
+     * three listings ahead is 1,472 units of obsidian, roughly four hours at a realistic rate, not
+     * the four minutes the listing count implied. That error is what made the aspirational upper
+     * half of the book look like a profitable place to queue.
+     */
+    public static long unitsAhead(List<Level> levels, List<Long> ownUnitPrices, long unitPrice,
+                                  int unitSize) {
+        long ahead = 0;
+        if (levels != null) {
+            for (Level l : levels) {
+                if (l != null && l.unitPrice < unitPrice) ahead += Math.max(0, l.units);
+            }
+        }
+        // Our own cheaper listings clear before this one too, and they are whole listings.
+        if (ownUnitPrices != null) {
+            for (Long own : ownUnitPrices) {
+                if (own != null && own < unitPrice) ahead += Math.max(1, unitSize);
+            }
+        }
+        return ahead;
+    }
+
+    /**
      * How much company we have on the sell side, which is what decides the pricing tactic.
      *
      * <p>These are not three shades of the same behaviour, they are three different trades:
@@ -181,7 +212,8 @@ public final class Liquidity {
      * faster-filling price. Until a fill has been measured the clearing rate is unknown, so the
      * quote undercuts the floor to buy that measurement as quickly as possible.
      */
-    public static Quote quote(List<Level> levels, List<Long> ownUnitPrices, double clearRate, Config cfg) {
+    public static Quote quote(List<Level> levels, List<Long> ownUnitPrices, double clearRate,
+                              int unitSize, Config cfg) {
         List<Level> book = sortedCompeting(levels);
         if (book.isEmpty()) {
             long open = Math.max(cfg.minPrice, cfg.fallbackPrice);
@@ -189,11 +221,18 @@ public final class Liquidity {
                     "no competitor visible; open regime");
         }
 
-        long floor = book.getFirst().unitPrice;
+        long floor = book.getFirst().unitPrice();
         if (!Double.isFinite(clearRate) || clearRate <= 0.0) {
-            long price = Math.max(cfg.minPrice, cfg.undercut(floor));
-            return new Quote(price, queueAhead(book, ownUnitPrices, price), Double.NaN, Double.NaN,
-                    "clearing rate unmeasured; undercutting floor " + floor + " to measure it");
+            long wanted = cfg.undercut(floor);
+            long price = Math.max(cfg.minPrice, wanted);
+            // Say which price is actually being listed. This branch used to report "undercutting
+            // floor 5900" while the minimum silently raised the listing to 6100, so the log
+            // described a trade the desk was not making.
+            String why = price > wanted
+                    ? "clearing rate unmeasured; wanted " + wanted + " under floor " + floor
+                            + " but the " + cfg.minPrice + " listing minimum binds"
+                    : "clearing rate unmeasured; undercutting floor " + floor + " to measure it";
+            return new Quote(price, queueAhead(book, ownUnitPrices, price), Double.NaN, Double.NaN, why);
         }
 
         List<Long> candidates = new ArrayList<>(book.size() + 1);
@@ -217,7 +256,10 @@ public final class Liquidity {
 
         for (long price : candidates) {
             int ahead = queueAhead(book, ownUnitPrices, price);
-            double wait = (ahead + 1) / clearRate;
+            // Depth in units, because the clearing rate is units per second. Counting listings
+            // here divided every wait by the stack size and made deep expensive queues look fast.
+            long depth = unitsAhead(book, ownUnitPrices, price, unitSize);
+            double wait = (depth + Math.max(1, unitSize)) / clearRate;
             double score = price / wait;                       // dollars per second per slot
             boolean withinHold = cfg.maxHoldSeconds <= 0.0 || wait <= cfg.maxHoldSeconds;
             boolean better = bestScore == Double.NEGATIVE_INFINITY

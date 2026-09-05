@@ -28,7 +28,7 @@ final class MixedStackBookTest {
 
     @Test
     void theCheapestPerItemIsTheFloorRegardlessOfLotSize() {
-        Liquidity.Quote q = Liquidity.quote(mixedBook(), List.of(), Double.NaN, CFG);
+        Liquidity.Quote q = Liquidity.quote(mixedBook(), List.of(), Double.NaN, 1, CFG);
         // Floor is 3,000/item from the 64-lot, so the undercut is one tick under that.
         assertEquals(CFG.undercut(3_000), q.unitPrice());
     }

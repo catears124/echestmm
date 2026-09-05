@@ -97,8 +97,12 @@ final class SweepAndRegimeTest {
     void buysBelowTheListingFloorBecauseThatFloorIsASellSideRule() {
         // cfg.minPrice is the cheapest we will ever list at. It must not stop us buying at 300.
         List<Liquidity.Level> book = List.of(level(300, 2, 128));
-        assertTrue(CFG.minPrice() > 300, "fixture only meaningful below the listing floor");
-        assertTrue(Sweep.plan(book, 900, 5_000_000L, 128, 0, CFG).go());
+        // A desk that has calibrated a high listing floor must still buy cheaply beneath it.
+        Liquidity.Config floored = new Liquidity.Config(5_000, CFG.fallbackPrice(), CFG.tick(),
+                CFG.maxHoldSeconds(), CFG.ladderStep(), CFG.snipeMarginPct(), CFG.liftMarginPct(),
+                CFG.maxLiftUnits(), CFG.maxCashSharePct());
+        assertTrue(floored.minPrice() > 300, "fixture only meaningful below the listing floor");
+        assertTrue(Sweep.plan(book, 900, 5_000_000L, 128, 0, floored).go());
     }
 
     @Test
@@ -121,7 +125,7 @@ final class SweepAndRegimeTest {
         // We rest at 6,800. The book collapses to 5,000. Undercutting 5,000 would win the sale
         // from ourselves at a $1,800 discount we chose to hand over.
         List<Liquidity.Level> book = List.of(level(5_000, 2, 128));
-        Liquidity.Quote quote = Liquidity.quote(book, List.of(6_800L), 0.5, CFG);
+        Liquidity.Quote quote = Liquidity.quote(book, List.of(6_800L), 0.5, 1, CFG);
         assertEquals(6_800, quote.unitPrice());
         assertTrue(quote.reason().contains("undercutting ourselves"), quote.reason());
     }
@@ -130,7 +134,7 @@ final class SweepAndRegimeTest {
     void stillUndercutsCompetitorsAboveOurLevel() {
         // Our own ask is cheap, so there is nothing to protect: undercut normally.
         List<Liquidity.Level> book = List.of(level(9_000, 2, 128));
-        Liquidity.Quote quote = Liquidity.quote(book, List.of(1_000L), 0.5, CFG);
+        Liquidity.Quote quote = Liquidity.quote(book, List.of(1_000L), 0.5, 1, CFG);
         assertTrue(quote.unitPrice() < 9_000, "expected an undercut, got " + quote.unitPrice());
         assertFalse(quote.reason().contains("undercutting ourselves"), quote.reason());
     }

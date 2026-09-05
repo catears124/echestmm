@@ -36,14 +36,14 @@ final class LiquidityTest {
 
     @Test
     void undercutsTheFloorUntilTheClearingRateIsMeasured() {
-        Liquidity.Quote q = Liquidity.quote(book(20_000, 21_000), List.of(), Double.NaN, CFG);
+        Liquidity.Quote q = Liquidity.quote(book(20_000, 21_000), List.of(), Double.NaN, 1, CFG);
         assertEquals(19_900, q.unitPrice());
         assertTrue(q.reason().contains("unmeasured"));
     }
 
     @Test
     void opensAtTheFallbackWhenNobodyElseIsListed() {
-        Liquidity.Quote q = Liquidity.quote(List.of(), List.of(), 0.5, CFG);
+        Liquidity.Quote q = Liquidity.quote(List.of(), List.of(), 0.5, 1, CFG);
         assertEquals(CFG.fallbackPrice(), q.unitPrice());
     }
 
@@ -51,11 +51,11 @@ final class LiquidityTest {
     void climbsTheBookOnlyWhenTheUpliftBeatsTheQueueDelay() {
         // Waiting behind one competitor doubles the time to fill, so it must at least double the
         // price. 80k over a 20k floor clears that bar; 30k over the same floor does not.
-        Liquidity.Quote rich = Liquidity.quote(book(20_000, 80_000), List.of(), 2.0, CFG);
+        Liquidity.Quote rich = Liquidity.quote(book(20_000, 80_000), List.of(), 2.0, 1, CFG);
         assertEquals(79_900, rich.unitPrice());
         assertEquals(1, rich.queueAhead());
 
-        Liquidity.Quote thin = Liquidity.quote(book(20_000, 30_000, 40_000), List.of(), 2.0, CFG);
+        Liquidity.Quote thin = Liquidity.quote(book(20_000, 30_000, 40_000), List.of(), 2.0, 1, CFG);
         assertEquals(19_900, thin.unitPrice());
         assertEquals(0, thin.queueAhead());
     }
@@ -63,7 +63,7 @@ final class LiquidityTest {
     @Test
     void staysAtTheFrontWhenLiquidityIsThin() {
         // 0.01 units/s: every extra place in the queue costs 100 s, which no uplift covers here.
-        Liquidity.Quote q = Liquidity.quote(book(20_000, 20_500, 21_000), List.of(), 0.01, CFG);
+        Liquidity.Quote q = Liquidity.quote(book(20_000, 20_500, 21_000), List.of(), 0.01, 1, CFG);
         assertEquals(19_900, q.unitPrice());
         assertEquals(0, q.queueAhead());
     }
@@ -74,7 +74,7 @@ final class LiquidityTest {
                 0.15, 0.25, 12, 0.20);
         // At 0.2 units/s, sitting behind 9 competitors takes 50 s: outside the 30 s budget.
         List<Liquidity.Level> deep = List.of(new Liquidity.Level(20_000, 9, 9), new Liquidity.Level(80_000, 1, 1));
-        Liquidity.Quote q = Liquidity.quote(deep, List.of(), 0.2, tight);
+        Liquidity.Quote q = Liquidity.quote(deep, List.of(), 0.2, 1, tight);
         assertEquals(19_900, q.unitPrice());
         assertTrue(q.expectedWaitSeconds() <= tight.maxHoldSeconds());
     }
@@ -83,7 +83,7 @@ final class LiquidityTest {
     void neverQuotesUnderTheMinimum() {
         Liquidity.Config floored = new Liquidity.Config(20_000, 25_000, 100, 900.0, 500,
                 0.15, 0.25, 12, 0.20);
-        Liquidity.Quote q = Liquidity.quote(book(15_000, 16_000), List.of(), Double.NaN, floored);
+        Liquidity.Quote q = Liquidity.quote(book(15_000, 16_000), List.of(), Double.NaN, 1, floored);
         assertTrue(q.unitPrice() >= floored.minPrice());
     }
 
