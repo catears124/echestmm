@@ -39,11 +39,14 @@ public final class Liquidity {
         }
     }
 
+    /** How far a bid ladder has walked, and why. */
+    public record BidPlan(boolean buy, long bid, String reason) {}
+
     /** Tunables. All money values are whole dollars, matching the auction house. */
     public record Config(
             long minPrice,          // never list below this
             long fallbackPrice,     // opening price when no competitor is visible
-            long undercut,          // how far under a competing level to list
+            long tick,              // the auction house price grid; Donut rounds listings to this
             double maxHoldSeconds,  // 0 = no cap; otherwise reject slower candidates when possible
             long ladderStep,        // probe step above the top of the book
             double snipeMarginPct,  // buy anything at or below quote * (1 - this)
@@ -52,8 +55,25 @@ public final class Liquidity {
             double maxCashSharePct  // never spend more than this share of liquid cash on a lift
     ) {
         public static Config defaults() {
-            return new Config(1_000, 25_000, 1, 900.0, 500, 0.15, 0.25, 12, 0.20);
+            return new Config(1_000, 25_000, 100, 900.0, 500, 0.15, 0.25, 12, 0.20);
         }
+
+        /** One tick under a competing level, snapped down onto the grid. */
+        public long undercut(long level) {
+            return quantize(level - tick, tick);
+        }
+    }
+
+    /**
+     * Snaps a price down onto the auction house grid.
+     *
+     * <p>This is not cosmetic. Donut rounds a listing price down to the nearest {@code tick}, so
+     * asking 5,599 lists at 5,500: the extra 99 is discarded, the sale receipt never matches the
+     * requested price, and every downstream tally that keys on price silently drifts.
+     */
+    public static long quantize(long price, long tick) {
+        if (tick <= 1) return price;
+        return price / tick * tick;
     }
 
     /** Exponential decay applied to the measured clearing rate per new fill. */
@@ -118,20 +138,20 @@ public final class Liquidity {
 
         long floor = book.getFirst().price;
         if (!Double.isFinite(clearRate) || clearRate <= 0.0) {
-            long price = Math.max(cfg.minPrice, floor - cfg.undercut);
+            long price = Math.max(cfg.minPrice, cfg.undercut(floor));
             return new Quote(price, queueAhead(book, ownPrices, price), Double.NaN, Double.NaN,
                     "clearing rate unmeasured; undercutting floor " + floor + " to measure it");
         }
 
         List<Long> candidates = new ArrayList<>(book.size() + 1);
         for (Level l : book) {
-            long p = l.price - cfg.undercut;
+            long p = cfg.undercut(l.price);
             if (p >= cfg.minPrice) candidates.add(p);
         }
-        long above = book.getLast().price + cfg.ladderStep;
+        long above = quantize(book.getLast().price + cfg.ladderStep, cfg.tick);
         if (above >= cfg.minPrice) candidates.add(above);
         if (candidates.isEmpty()) {
-            long price = cfg.minPrice;
+            long price = Math.max(cfg.minPrice, quantize(cfg.minPrice, cfg.tick));
             return new Quote(price, queueAhead(book, ownPrices, price), Double.NaN, Double.NaN,
                     "every undercut price is below the minimum; listing at the minimum");
         }
@@ -168,7 +188,54 @@ public final class Liquidity {
     /** Anything listed at or below this is cheap enough to buy for resale. */
     public static long snipeCeiling(long quotePrice, Config cfg) {
         if (quotePrice <= 0) return 0;
-        return (long) Math.floor(quotePrice * (1.0 - cfg.snipeMarginPct));
+        return quantize((long) Math.floor(quotePrice * (1.0 - cfg.snipeMarginPct)), cfg.tick);
+    }
+
+    /**
+     * Two-sided market making on a thin but liquid book: rest an ask high, then walk a bid up from
+     * far below it until the book starts hitting you.
+     *
+     * <p>Obsidian is the case this exists for. A naive buyer pays the floor, which drifts up as
+     * they lift it - an average cost above the resting ask. A ladder instead starts well under the
+     * floor and only concedes a tick at a time while nothing fills, so acquisition happens at the
+     * bottom of the range and every fill is already profitable against the resting ask. A fill
+     * walks the bid back down, because a book that just traded at your bid will trade there again.
+     *
+     * @param currentBid   the bid in force, or 0 to start the ladder
+     * @param askInForce   our own resting ask; the ceiling is derived from it, never exceeded
+     * @param quiet        true when nothing has filled for the probe interval
+     * @param filled       true when the last probe bought something
+     */
+    public static BidPlan ladderBid(long currentBid, long askInForce, boolean quiet, boolean filled,
+                                    long start, long step, double minSpreadPct, Config cfg) {
+        long ceiling = askInForce > 0
+                ? quantize((long) Math.floor(askInForce * (1.0 - minSpreadPct)), cfg.tick)
+                : 0;
+        if (ceiling <= 0) return new BidPlan(false, 0, "no resting ask to price a bid against");
+
+        long floorBid = quantize(Math.max(cfg.tick, start), cfg.tick);
+        if (floorBid > ceiling) {
+            return new BidPlan(false, 0, "ladder start " + floorBid + " is already above the "
+                    + ceiling + " ceiling implied by the " + Math.round(minSpreadPct * 100) + "% spread");
+        }
+
+        long bid = currentBid <= 0 ? floorBid : quantize(currentBid, cfg.tick);
+        String reason;
+        if (filled) {
+            // A fill proves the bottom of the range is live; step back down and keep the spread.
+            bid = Math.max(floorBid, bid - quantize(Math.max(cfg.tick, step), cfg.tick));
+            reason = "filled at the last bid; stepping back down to " + bid;
+        } else if (quiet) {
+            if (bid >= ceiling) {
+                reason = "bid is at the " + ceiling + " ceiling; waiting rather than paying up";
+                return new BidPlan(true, ceiling, reason);
+            }
+            bid = Math.min(ceiling, bid + quantize(Math.max(cfg.tick, step), cfg.tick));
+            reason = "nothing filled this probe; conceding a step to " + bid;
+        } else {
+            reason = "holding the bid at " + bid;
+        }
+        return new BidPlan(true, Math.min(bid, ceiling), reason);
     }
 
     /**
@@ -210,8 +277,8 @@ public final class Liquidity {
         for (Level l : book) {
             if (l.price >= targetFloor) { newFloor = l.price; break; }
         }
-        long liftedAsk = Math.max(cfg.minPrice, newFloor - cfg.undercut);
-        long oldAsk = Math.max(cfg.minPrice, book.getFirst().price - cfg.undercut);
+        long liftedAsk = Math.max(cfg.minPrice, cfg.undercut(newFloor));
+        long oldAsk = Math.max(cfg.minPrice, cfg.undercut(book.getFirst().price));
         if (liftedAsk <= oldAsk) return LiftPlan.no("lift would not raise our own ask");
 
         // Resale of what we buy, plus the uplift on the inventory we were going to list anyway.
@@ -224,7 +291,7 @@ public final class Liquidity {
             return LiftPlan.no("modelled return " + expectedReturn + " under the required " + required);
         }
 
-        return new LiftPlan(true, targetFloor - 1, units, cost, newFloor, expectedReturn,
+        return new LiftPlan(true, quantize(targetFloor - cfg.tick, cfg.tick), units, cost, newFloor, expectedReturn,
                 "clear " + units + " listings under " + targetFloor + " for " + cost
                         + "; ask moves " + oldAsk + " -> " + liftedAsk);
     }

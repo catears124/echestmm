@@ -37,7 +37,7 @@ final class LiquidityTest {
     @Test
     void undercutsTheFloorUntilTheClearingRateIsMeasured() {
         Liquidity.Quote q = Liquidity.quote(book(20_000, 21_000), List.of(), Double.NaN, CFG);
-        assertEquals(19_999, q.price());
+        assertEquals(19_900, q.price());
         assertTrue(q.reason().contains("unmeasured"));
     }
 
@@ -52,11 +52,11 @@ final class LiquidityTest {
         // Waiting behind one competitor doubles the time to fill, so it must at least double the
         // price. 80k over a 20k floor clears that bar; 30k over the same floor does not.
         Liquidity.Quote rich = Liquidity.quote(book(20_000, 80_000), List.of(), 2.0, CFG);
-        assertEquals(79_999, rich.price());
+        assertEquals(79_900, rich.price());
         assertEquals(1, rich.queueAhead());
 
         Liquidity.Quote thin = Liquidity.quote(book(20_000, 30_000, 40_000), List.of(), 2.0, CFG);
-        assertEquals(19_999, thin.price());
+        assertEquals(19_900, thin.price());
         assertEquals(0, thin.queueAhead());
     }
 
@@ -64,24 +64,24 @@ final class LiquidityTest {
     void staysAtTheFrontWhenLiquidityIsThin() {
         // 0.01 units/s: every extra place in the queue costs 100 s, which no uplift covers here.
         Liquidity.Quote q = Liquidity.quote(book(20_000, 20_500, 21_000), List.of(), 0.01, CFG);
-        assertEquals(19_999, q.price());
+        assertEquals(19_900, q.price());
         assertEquals(0, q.queueAhead());
     }
 
     @Test
     void respectsTheHoldBudgetOverRawRevenueRate() {
-        Liquidity.Config tight = new Liquidity.Config(1_000, 25_000, 1, 30.0, 500,
+        Liquidity.Config tight = new Liquidity.Config(1_000, 25_000, 100, 30.0, 500,
                 0.15, 0.25, 12, 0.20);
         // At 0.2 units/s, sitting behind 9 competitors takes 50 s: outside the 30 s budget.
         List<Liquidity.Level> deep = List.of(new Liquidity.Level(20_000, 9), new Liquidity.Level(80_000, 1));
         Liquidity.Quote q = Liquidity.quote(deep, List.of(), 0.2, tight);
-        assertEquals(19_999, q.price());
+        assertEquals(19_900, q.price());
         assertTrue(q.expectedWaitSeconds() <= tight.maxHoldSeconds());
     }
 
     @Test
     void neverQuotesUnderTheMinimum() {
-        Liquidity.Config floored = new Liquidity.Config(20_000, 25_000, 1, 900.0, 500,
+        Liquidity.Config floored = new Liquidity.Config(20_000, 25_000, 100, 900.0, 500,
                 0.15, 0.25, 12, 0.20);
         Liquidity.Quote q = Liquidity.quote(book(15_000, 16_000), List.of(), Double.NaN, floored);
         assertTrue(q.price() >= floored.minPrice());
@@ -103,7 +103,7 @@ final class LiquidityTest {
         assertEquals(2, plan.units());
         assertEquals(40_000, plan.cost());
         assertEquals(40_000, plan.newFloor());
-        assertEquals(39_999, plan.buyUpTo());
+        assertEquals(39_900, plan.buyUpTo());
         assertTrue(plan.expectedReturn() > plan.cost());
     }
 

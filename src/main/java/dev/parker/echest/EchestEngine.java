@@ -3,8 +3,10 @@ package dev.parker.echest;
 import com.mojang.brigadier.Command;
 import com.mojang.brigadier.arguments.BoolArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.AbstractButton;
 import net.minecraft.client.gui.components.events.ContainerEventHandler;
@@ -35,27 +37,22 @@ import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.argument;
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommands.literal;
 
 /**
- * The only class that sends anything to the server.
+ * The only class that sends anything to the server, and the only one that spends pacing budget.
  *
- * <p>Two jobs, one state machine, one command budget - so the seller and the buyer can never fight
- * over the cursor or the auction screen:
+ * <p>It runs one desk at a time. A desk is an item, a listing unit size, and which sides are
+ * enabled:
  *
- * <ol>
- *   <li><b>Dump.</b> Ender chests arrive as stacks. One unit at a time is moved into a free hotbar
- *       slot, listed with {@code /ah sell PRICE} at the liquidity-derived price from
- *       {@link Liquidity#quote}, and confirmed only when the server's own dialog shows that exact
- *       price. Stacks are never listed whole.</li>
- *   <li><b>Floor work.</b> Listings priced far under our quote are bought for resale, and the
- *       cheap tail under the target floor is bought out entirely when {@link
- *       Liquidity#planFloorLift} says the modelled return clears cost - which lifts the visible
- *       floor and every subsequent ask with it.</li>
- * </ol>
+ * <ul>
+ *   <li><b>Ender chests</b> - sell side only, one unit per listing. Stacks are split a unit at a
+ *       time and listed at the liquidity price.</li>
+ *   <li><b>Obsidian</b> - both sides, a full stack per listing. Stacks rest high on the ask while
+ *       a bid ladder walks up from far below the floor, so acquisition happens at the bottom of
+ *       the range instead of at a floor that rises as you lift it.</li>
+ * </ul>
  *
- * <p>Reads are cached: the own-listings screen is re-read when the free-slot count runs out, every
- * {@code OWN_REREAD_EVERY} sales, or when a receipt names a price the local tally does not know;
- * the market page is re-read every {@code MARKET_RECHECK_TICKS} and after every buy. Commands are
- * spaced by {@code commandGapTicks}, which grows whenever the server complains about speed.
- * Everything is off until {@code /echestmm on}.
+ * <p>Every command, slot click and dialog press passes through {@link ActionPacer}. Reads are
+ * cached, and the market page is reused while it is fresh rather than re-searched, because an open
+ * page keeps updating itself from inbound packets for free.
  */
 public final class EchestEngine {
     private static final int HOTBAR_START = 37;   // hotbar key 2; key 1 (slot 36) is never touched
@@ -66,16 +63,16 @@ public final class EchestEngine {
     private static final int CLICK_INTERVAL_TICKS = 2;
     private static final int CLICK_SETTLE_TICKS = 5;
     private static final int MAX_CURSOR_FIXES = 2;
-    private static final int BASE_COMMAND_GAP_TICKS = 9;   // ~450 ms; Donut's cooldown is ~400 ms
-    private static final int MAX_COMMAND_GAP_TICKS = 40;
     private static final int SCREEN_TIMEOUT_TICKS = 60;
     private static final int SOLD_TIMEOUT_TICKS = 80;
     private static final int FULL_RECHECK_TICKS = 200;
     private static final int MARKET_RECHECK_TICKS = 600;
     private static final int OWN_REREAD_EVERY = 25;
     private static final int BALANCE_REFRESH_TICKS = 2400;
-    private static final int BUY_WINDOW_TICKS = 2400;
-    private static final int MAX_RETRIES = 3;
+    /** An open auction page younger than this is reused instead of re-searched. */
+    private static final long PAGE_FRESH_MS = 1_500L;
+    /** Weight charged for one inventory shuffling click; three of them cost one interaction. */
+    private static final double CLICK_WEIGHT = 0.34;
 
     private static final Pattern BALANCE = Pattern.compile(
             "(?i)balance[^0-9$]{0,16}\\$?\\s*([0-9][0-9,]*(?:\\.[0-9]+)?)\\s*([kmbt]?)");
@@ -85,29 +82,43 @@ public final class EchestEngine {
         CHECK_OWN, WAIT_OWN_AH, WAIT_OWN_SCAN,
         CHECK_MARKET, WAIT_MARKET,
         PREPARE_SELL, SELL_CMD, WAIT_CONFIRM, WAIT_SOLD, WAIT_FULL,
-        BUY_OPEN, BUY_WAIT_PAGE, BUY_CLICK, BUY_CONFIRM, BUY_SETTLE
+        BUY_OPEN, BUY_WAIT_PAGE, BUY_CONFIRM, BUY_SETTLE
     }
 
     private record Click(int slot, int button, ContainerInput input) {}
 
-    /** A listing of ours that is live on the market, kept to measure hold time on the sale. */
+    /** A listing of ours that is live, kept to measure hold time when it sells. */
     private record LiveListing(long price, long listedAtMs, int queueAhead) {}
 
-    // ---- configuration ---------------------------------------------------------------------
+    // ---- desk configuration ----------------------------------------------------------------
     private static String itemId = "minecraft:ender_chest";
     private static String searchTerm = "ender chest";
-    private static Liquidity.Config cfg = Liquidity.Config.defaults();
+    private static int unitSize = 1;              // items per listing: 1 for echests, 64 for obsidian
+    private static boolean selling = true;
     private static boolean sniping = true;
     private static boolean lifting = true;
-    private static int maxBuysPerWindow = 10;
+    private static boolean acquiring = false;     // bid ladder; the obsidian side
+    private static Liquidity.Config cfg = Liquidity.Config.defaults();
+
+    // bid ladder
+    private static long bidStart = 25_000;
+    private static long bidStep = 500;
+    private static double minSpreadPct = 0.25;
+    private static long probeSeconds = 20;
+    private static int maxHoldUnits = 20;         // stop acquiring above this many listings' worth
+    private static long currentBid;
+    private static long lastProbeMs;
+    private static long lastAcquireFillMs;
+    private static int acquired;
+    private static long acquiredCost;
+    private static boolean lastProbeFilled;
+
     private static boolean debug = true;
 
     // ---- runtime ---------------------------------------------------------------------------
     private static State state = State.OFF;
     private static final ArrayDeque<Click> queue = new ArrayDeque<>();
     private static long ticks;
-    private static long lastCommandTick = -1_000_000L;
-    private static int commandGapTicks = BASE_COMMAND_GAP_TICKS;
     private static long requestMs;
     private static int waited;
     private static int cooldown;
@@ -115,21 +126,20 @@ public final class EchestEngine {
     private static int cursorFixes;
     private static long lastContainerCloseTick = -1_000_000L;
     private static String pauseReason = "";
+    private static final int MAX_RETRIES = 3;
 
     private static int sellSlot = -1;
     private static long currentPrice;
     private static int currentQueueAhead;
+    private static int listed;
     private static int sold;
     private static long grossSold;
     private static boolean listReceiptSeen;
 
     private static int bought;
     private static long grossBought;
-    private static int buysInWindow;
-    private static long buyWindowStart = -1_000_000L;
     private static int buySlot = -1;
     private static long buyMaxPay;
-    private static long buyExpectedPrice;
     private static String buyReason = "";
     private static long buyBudgetRemaining;
 
@@ -150,6 +160,7 @@ public final class EchestEngine {
 
     private static Liquidity.Quote lastQuote;
     private static Liquidity.LiftPlan lastLift = Liquidity.LiftPlan.no("not evaluated");
+    private static Liquidity.BidPlan lastBid = new Liquidity.BidPlan(false, 0, "not evaluated");
 
     private EchestEngine() {}
 
@@ -157,6 +168,14 @@ public final class EchestEngine {
         ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::tick);
         MarketFeed.onReceipt(EchestEngine::onReceipt);
         MarketFeed.onMessage(EchestEngine::onMessage);
+        // A kick arrives as a plain disconnect with no warning line, so the disconnect itself is
+        // the signal. Penalise the persistent ceiling before the next session can repeat it.
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            if (state == State.OFF || state == State.PAUSED) return;
+            ActionPacer.penalize(System.currentTimeMillis(), "disconnected while trading");
+            state = State.OFF;
+            queue.clear();
+        });
         registerCommands();
     }
 
@@ -171,10 +190,35 @@ public final class EchestEngine {
                             return Command.SINGLE_SUCCESS;
                         })
                         .then(literal("status").executes(ctx -> feedback(ctx.getSource()::sendFeedback, status())))
+                        .then(literal("pace").executes(ctx -> feedback(ctx.getSource()::sendFeedback, pacing())))
                         .then(literal("debug").executes(ctx -> {
                             debug = !debug;
                             return feedback(ctx.getSource()::sendFeedback, "trace " + (debug ? "ON" : "OFF"));
                         }))
+                        .then(literal("desk").then(argument("name", StringArgumentType.word()).executes(ctx -> {
+                            String name = StringArgumentType.getString(ctx, "name").toLowerCase(Locale.ROOT);
+                            return feedback(ctx.getSource()::sendFeedback, applyDesk(name));
+                        })))
+                        .then(literal("item").then(argument("item", StringArgumentType.word()).executes(ctx -> {
+                            String raw = StringArgumentType.getString(ctx, "item").toLowerCase(Locale.ROOT);
+                            itemId = raw.contains(":") ? raw : "minecraft:" + raw;
+                            searchTerm = itemId.substring(itemId.indexOf(':') + 1).replace('_', ' ');
+                            invalidateCaches();
+                            return feedback(ctx.getSource()::sendFeedback, "item " + itemId + ", search \"" + searchTerm + "\"");
+                        })))
+                        .then(literal("unit").then(argument("size", IntegerArgumentType.integer(1, 64)).executes(ctx -> {
+                            unitSize = IntegerArgumentType.getInteger(ctx, "size");
+                            return feedback(ctx.getSource()::sendFeedback, "listing unit " + unitSize + " item(s)");
+                        })))
+                        .then(literal("sell").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
+                            selling = BoolArgumentType.getBool(ctx, "on");
+                            return feedback(ctx.getSource()::sendFeedback, "sell side " + (selling ? "ON" : "OFF"));
+                        })))
+                        .then(literal("acquire").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
+                            acquiring = BoolArgumentType.getBool(ctx, "on");
+                            currentBid = 0;
+                            return feedback(ctx.getSource()::sendFeedback, "bid ladder " + (acquiring ? "ON" : "OFF"));
+                        })))
                         .then(literal("snipe").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
                             sniping = BoolArgumentType.getBool(ctx, "on");
                             return feedback(ctx.getSource()::sendFeedback, "sniping " + (sniping ? "ON" : "OFF"));
@@ -182,6 +226,28 @@ public final class EchestEngine {
                         .then(literal("lift").then(argument("on", BoolArgumentType.bool()).executes(ctx -> {
                             lifting = BoolArgumentType.getBool(ctx, "on");
                             return feedback(ctx.getSource()::sendFeedback, "floor lifting " + (lifting ? "ON" : "OFF"));
+                        })))
+                        .then(literal("bid").then(argument("start", IntegerArgumentType.integer(1)).executes(ctx -> {
+                            bidStart = IntegerArgumentType.getInteger(ctx, "start");
+                            currentBid = 0;
+                            return feedback(ctx.getSource()::sendFeedback, "ladder starts at " + bidStart);
+                        })))
+                        .then(literal("bidstep").then(argument("step", IntegerArgumentType.integer(1)).executes(ctx -> {
+                            bidStep = IntegerArgumentType.getInteger(ctx, "step");
+                            return feedback(ctx.getSource()::sendFeedback, "ladder step " + bidStep);
+                        })))
+                        .then(literal("spread").then(argument("percent", IntegerArgumentType.integer(1, 90)).executes(ctx -> {
+                            minSpreadPct = IntegerArgumentType.getInteger(ctx, "percent") / 100.0;
+                            return feedback(ctx.getSource()::sendFeedback, "minimum bid-ask spread "
+                                    + Math.round(minSpreadPct * 100) + "%");
+                        })))
+                        .then(literal("probe").then(argument("seconds", IntegerArgumentType.integer(2)).executes(ctx -> {
+                            probeSeconds = IntegerArgumentType.getInteger(ctx, "seconds");
+                            return feedback(ctx.getSource()::sendFeedback, "ladder probe " + probeSeconds + "s");
+                        })))
+                        .then(literal("hold").then(argument("units", IntegerArgumentType.integer(0)).executes(ctx -> {
+                            maxHoldUnits = IntegerArgumentType.getInteger(ctx, "units");
+                            return feedback(ctx.getSource()::sendFeedback, "stop acquiring above " + maxHoldUnits + " units");
                         })))
                         .then(literal("min").then(argument("price", IntegerArgumentType.integer(1)).executes(ctx -> {
                             cfg = withMin(cfg, IntegerArgumentType.getInteger(ctx, "price"));
@@ -191,24 +257,19 @@ public final class EchestEngine {
                             cfg = withFallback(cfg, IntegerArgumentType.getInteger(ctx, "price"));
                             return feedback(ctx.getSource()::sendFeedback, "empty-book price " + cfg.fallbackPrice());
                         })))
-                        .then(literal("hold").then(argument("seconds", IntegerArgumentType.integer(0)).executes(ctx -> {
-                            cfg = withHold(cfg, IntegerArgumentType.getInteger(ctx, "seconds"));
+                        .then(literal("tick").then(argument("size", IntegerArgumentType.integer(1)).executes(ctx -> {
+                            cfg = withTick(cfg, IntegerArgumentType.getInteger(ctx, "size"));
+                            return feedback(ctx.getSource()::sendFeedback, "price grid " + cfg.tick());
+                        })))
+                        .then(literal("wait").then(argument("seconds", IntegerArgumentType.integer(0)).executes(ctx -> {
+                            cfg = withHoldSeconds(cfg, IntegerArgumentType.getInteger(ctx, "seconds"));
                             return feedback(ctx.getSource()::sendFeedback, cfg.maxHoldSeconds() <= 0
-                                    ? "hold budget OFF (pure revenue-rate pricing)"
-                                    : "hold budget " + Math.round(cfg.maxHoldSeconds()) + "s");
+                                    ? "fill-time budget OFF" : "fill-time budget " + Math.round(cfg.maxHoldSeconds()) + "s");
                         })))
                         .then(literal("margin").then(argument("percent", IntegerArgumentType.integer(1, 90)).executes(ctx -> {
                             cfg = withSnipeMargin(cfg, IntegerArgumentType.getInteger(ctx, "percent") / 100.0);
                             return feedback(ctx.getSource()::sendFeedback, "snipe margin "
                                     + Math.round(cfg.snipeMarginPct() * 100) + "%");
-                        })))
-                        .then(literal("liftunits").then(argument("count", IntegerArgumentType.integer(1, 45)).executes(ctx -> {
-                            cfg = withLiftUnits(cfg, IntegerArgumentType.getInteger(ctx, "count"));
-                            return feedback(ctx.getSource()::sendFeedback, "max lift units " + cfg.maxLiftUnits());
-                        })))
-                        .then(literal("buys").then(argument("count", IntegerArgumentType.integer(0, 60)).executes(ctx -> {
-                            maxBuysPerWindow = IntegerArgumentType.getInteger(ctx, "count");
-                            return feedback(ctx.getSource()::sendFeedback, "max buys per 2 min " + maxBuysPerWindow);
                         })))
                         .then(literal("recheck").executes(ctx -> {
                             invalidateCaches();
@@ -218,29 +279,69 @@ public final class EchestEngine {
         );
     }
 
+    /** Preset desks, so switching between the two markets is one command. */
+    private static String applyDesk(String name) {
+        switch (name) {
+            case "echest", "enderchest", "ender_chest" -> {
+                itemId = "minecraft:ender_chest";
+                searchTerm = "ender chest";
+                unitSize = 1;
+                selling = true;
+                sniping = true;
+                lifting = true;
+                acquiring = false;
+                cfg = withFallback(withMin(Liquidity.Config.defaults(), 4_000), 25_000);
+            }
+            case "obsidian", "obby" -> {
+                itemId = "minecraft:obsidian";
+                searchTerm = "obsidian";
+                unitSize = 64;
+                selling = true;
+                sniping = false;      // the ladder is the buy side here, not opportunistic snipes
+                lifting = true;
+                acquiring = true;
+                cfg = withFallback(withMin(Liquidity.Config.defaults(), 15_000), 40_000);
+                bidStart = 25_000;
+                bidStep = 500;
+                minSpreadPct = 0.25;
+                maxHoldUnits = 20;
+            }
+            default -> {
+                return "unknown desk \"" + name + "\"; use echest or obsidian";
+            }
+        }
+        currentBid = 0;
+        invalidateCaches();
+        return "desk " + name + ": " + itemId + " x" + unitSize + " per listing, sell="
+                + selling + " acquire=" + acquiring + " lift=" + lifting
+                + ", min " + cfg.minPrice() + ", empty-book " + cfg.fallbackPrice()
+                + (acquiring ? ", ladder from " + bidStart + " step " + bidStep
+                    + " under a " + Math.round(minSpreadPct * 100) + "% spread" : "");
+    }
+
     private static Liquidity.Config withMin(Liquidity.Config c, long v) {
-        return new Liquidity.Config(v, c.fallbackPrice(), c.undercut(), c.maxHoldSeconds(), c.ladderStep(),
+        return new Liquidity.Config(v, c.fallbackPrice(), c.tick(), c.maxHoldSeconds(), c.ladderStep(),
                 c.snipeMarginPct(), c.liftMarginPct(), c.maxLiftUnits(), c.maxCashSharePct());
     }
 
     private static Liquidity.Config withFallback(Liquidity.Config c, long v) {
-        return new Liquidity.Config(c.minPrice(), v, c.undercut(), c.maxHoldSeconds(), c.ladderStep(),
+        return new Liquidity.Config(c.minPrice(), v, c.tick(), c.maxHoldSeconds(), c.ladderStep(),
                 c.snipeMarginPct(), c.liftMarginPct(), c.maxLiftUnits(), c.maxCashSharePct());
     }
 
-    private static Liquidity.Config withHold(Liquidity.Config c, double v) {
-        return new Liquidity.Config(c.minPrice(), c.fallbackPrice(), c.undercut(), v, c.ladderStep(),
+    private static Liquidity.Config withTick(Liquidity.Config c, long v) {
+        return new Liquidity.Config(c.minPrice(), c.fallbackPrice(), v, c.maxHoldSeconds(), c.ladderStep(),
+                c.snipeMarginPct(), c.liftMarginPct(), c.maxLiftUnits(), c.maxCashSharePct());
+    }
+
+    private static Liquidity.Config withHoldSeconds(Liquidity.Config c, double v) {
+        return new Liquidity.Config(c.minPrice(), c.fallbackPrice(), c.tick(), v, c.ladderStep(),
                 c.snipeMarginPct(), c.liftMarginPct(), c.maxLiftUnits(), c.maxCashSharePct());
     }
 
     private static Liquidity.Config withSnipeMargin(Liquidity.Config c, double v) {
-        return new Liquidity.Config(c.minPrice(), c.fallbackPrice(), c.undercut(), c.maxHoldSeconds(), c.ladderStep(),
+        return new Liquidity.Config(c.minPrice(), c.fallbackPrice(), c.tick(), c.maxHoldSeconds(), c.ladderStep(),
                 v, c.liftMarginPct(), c.maxLiftUnits(), c.maxCashSharePct());
-    }
-
-    private static Liquidity.Config withLiftUnits(Liquidity.Config c, int v) {
-        return new Liquidity.Config(c.minPrice(), c.fallbackPrice(), c.undercut(), c.maxHoldSeconds(), c.ladderStep(),
-                c.snipeMarginPct(), c.liftMarginPct(), v, c.maxCashSharePct());
     }
 
     private static int feedback(Consumer<Component> out, String msg) {
@@ -250,17 +351,24 @@ public final class EchestEngine {
 
     private static String status() {
         return "state=" + state + (state == State.PAUSED ? " (" + pauseReason + ")" : "")
-                + " | item=" + itemId
-                + " | quote=" + (lastQuote == null ? "n/a" : lastQuote.price() + " (" + lastQuote.reason() + ")")
+                + " | " + itemId + " x" + unitSize
+                + " | ask=" + (lastQuote == null ? "n/a" : String.valueOf(lastQuote.price()))
                 + " | clear=" + (Double.isFinite(clearRate) ? String.format(Locale.ROOT, "%.3f/s", clearRate) : "unmeasured")
-                + " | fills=" + fills.size()
+                + " (" + fills.size() + " fills)"
                 + " | free=" + localFree
-                + " | sold=" + sold + " ($" + grossSold + ")"
+                + " | listed=" + listed + " sold=" + sold + " ($" + grossSold + ")"
                 + " | bought=" + bought + " ($" + grossBought + ")"
+                + (acquiring ? " | bid=" + currentBid + " acquired=" + acquired + " ($" + acquiredCost + ")" : "")
                 + " | cash=" + (cash < 0 ? "unknown" : "$" + cash)
-                + " | snipe=" + (sniping ? "on" : "off") + " lift=" + (lifting ? "on" : "off")
-                + " | lift=" + lastLift.reason()
-                + " | gap=" + commandGapTicks * 50 + "ms";
+                + " | pace=" + String.format(Locale.ROOT, "%.2f/s", ActionPacer.cap());
+    }
+
+    private static String pacing() {
+        return "pacing ceiling " + String.format(Locale.ROOT, "%.2f", ActionPacer.cap())
+                + " actions/s, " + ActionPacer.penalties() + " penalties on record, "
+                + ActionPacer.cleanSeconds(System.currentTimeMillis()) + "s clean, "
+                + ActionPacer.spent() + " actions this session."
+                + " Kicks recorded at 2.0-2.2/s, so the ceiling only recovers after 10 clean minutes.";
     }
 
     // ---- lifecycle -------------------------------------------------------------------------
@@ -271,22 +379,24 @@ public final class EchestEngine {
         waited = 0;
         cooldown = 0;
         cursorFixes = 0;
-        commandGapTicks = BASE_COMMAND_GAP_TICKS;
         queue.clear();
+        currentBid = 0;
+        lastProbeMs = System.currentTimeMillis();
         LocalPlayer p = Minecraft.getInstance().player;
         selfName = p == null ? "" : p.getGameProfile().name();
+        ActionPacer.noteResumed(System.currentTimeMillis());
         setState(State.CHECK_OWN, "start");
-        feedback.accept(Component.literal("[EchestMM] ON: dumping 1x " + itemId
-                + " at the liquidity price (min " + cfg.minPrice() + ", empty-book " + cfg.fallbackPrice()
-                + "), snipe " + (sniping ? "on" : "off") + ", lift " + (lifting ? "on" : "off")
-                + ". Hotbar slots 2-9 are used. /echestmm to stop."));
+        feedback.accept(Component.literal("[EchestMM] ON: " + itemId + " x" + unitSize + " per listing"
+                + (selling ? ", selling at the liquidity price" : ", sell side off")
+                + (acquiring ? ", bidding from " + bidStart + " under a " + Math.round(minSpreadPct * 100) + "% spread" : "")
+                + ", pace " + String.format(Locale.ROOT, "%.2f", ActionPacer.cap()) + " actions/s."));
     }
 
     private static void stop(Consumer<Component> feedback, String why) {
         setState(State.OFF, why);
         queue.clear();
-        feedback.accept(Component.literal("[EchestMM] OFF (" + why + "). Sold " + sold + " for $" + grossSold
-                + ", bought " + bought + " for $" + grossBought + "."));
+        feedback.accept(Component.literal("[EchestMM] OFF (" + why + "). Listed " + listed + ", sold " + sold
+                + " for $" + grossSold + ", bought " + bought + " for $" + grossBought + "."));
     }
 
     private static void pause(LocalPlayer player, String why) {
@@ -309,7 +419,7 @@ public final class EchestEngine {
         trace(state + " -> " + next + (why == null || why.isEmpty() ? "" : "  (" + why + ")"));
         state = next;
         waited = 0;
-        queue.clear();   // a half-finished click sequence must never resume in another state
+        queue.clear();
     }
 
     private static void trace(String msg) {
@@ -326,9 +436,12 @@ public final class EchestEngine {
         switch (r.kind()) {
             case "LIST" -> {
                 if (state != State.WAIT_CONFIRM && state != State.WAIT_SOLD) return;
-                if (r.count() != 1) {
+                if (r.count() != unitSize) {
                     LocalPlayer p = Minecraft.getInstance().player;
-                    if (p != null) pause(p, "server listed " + r.count() + " items in one listing: \"" + r.raw() + "\"");
+                    if (p != null) {
+                        pause(p, "server listed " + r.count() + " items but the unit is " + unitSize
+                                + ": \"" + r.raw() + "\"");
+                    }
                     return;
                 }
                 listReceiptSeen = true;
@@ -342,34 +455,26 @@ public final class EchestEngine {
     private static void onMessage(MarketFeed.MarketMessage m) {
         if (state == State.OFF) return;
         switch (m.kind()) {
-            case "RATE_LIMIT" -> {
-                commandGapTicks = Math.min(MAX_COMMAND_GAP_TICKS, commandGapTicks + 4);
-                lastCommandTick = ticks;
-                trace("rate-limited by the server; command gap now " + commandGapTicks * 50 + " ms");
-            }
+            case "RATE_LIMIT" -> ActionPacer.penalize(System.currentTimeMillis(), "server rate-limit line");
             case "AH_FULL" -> {
                 if (state == State.SELL_CMD || state == State.WAIT_CONFIRM || state == State.WAIT_SOLD) {
                     localFree = 0;
                     ownDirty = true;
                     retries = 0;
-                    lastCommandTick = ticks;
                     closeAnyScreen();
                     enterFull("server: too many listed items");
                 }
             }
             case "ALREADY_BOUGHT" -> {
-                if (state == State.BUY_CONFIRM || state == State.BUY_CLICK || state == State.BUY_SETTLE) {
-                    trace("lost the race for slot " + buySlot + "; re-reading the market");
-                    closeAnyScreen();
-                    lastMarketTick = -1;
-                    lastCommandTick = ticks;
+                if (state == State.BUY_CONFIRM || state == State.BUY_SETTLE || state == State.BUY_WAIT_PAGE) {
+                    trace("lost the race for slot " + buySlot + "; the page will refresh itself");
                     next("cheap listing was already bought");
                 }
             }
             case "NO_FUNDS" -> {
                 cash = 0;
                 lastBalanceTick = -1_000_000L;
-                trace("server says there is not enough money; buying is on hold until /bal refreshes");
+                trace("server reports insufficient funds; buying pauses until /bal refreshes");
                 closeAnyScreen();
                 next("insufficient funds");
             }
@@ -387,7 +492,7 @@ public final class EchestEngine {
     }
 
     private static void onOwnSale(MarketFeed.Receipt r) {
-        if (!namesSellItem(r.itemName())) return;
+        if (!namesDeskItem(r.itemName())) return;
         if (localFree >= 0) localFree++;
         long price = Math.round(r.totalPrice());
         sold++;
@@ -422,23 +527,25 @@ public final class EchestEngine {
     }
 
     private static void onOwnPurchase(MarketFeed.Receipt r) {
-        if (!namesSellItem(r.itemName())) return;
+        if (!namesDeskItem(r.itemName())) return;
         long price = Math.round(r.totalPrice());
-        bought += Math.max(1, r.count());
+        bought++;
         grossBought += price;
         if (cash >= 0) cash = Math.max(0, cash - price);
         buyBudgetRemaining = Math.max(0, buyBudgetRemaining - price);
-        lastMarketTick = -1;    // the book changed underneath us
-        trace("bought " + r.count() + "x at " + price + " (" + buyReason + ")");
-        if (state == State.BUY_CONFIRM || state == State.BUY_SETTLE) {
-            closeAnyScreen();
-            lastCommandTick = ticks;
-            next("bought a cheap listing");
+        lastMarketTick = -1;
+        if (acquiring) {
+            acquired++;
+            acquiredCost += price;
+            lastAcquireFillMs = System.currentTimeMillis();
+            lastProbeFilled = true;
         }
+        trace("bought " + r.count() + "x at " + price + " (" + buyReason + ")");
+        if (state == State.BUY_CONFIRM || state == State.BUY_SETTLE) next("bought");
     }
 
     /** "Ender Chest" names minecraft:ender_chest. */
-    private static boolean namesSellItem(String itemName) {
+    private static boolean namesDeskItem(String itemName) {
         if (itemName == null) return false;
         String path = itemId.substring(itemId.indexOf(':') + 1);
         return itemName.trim().toLowerCase(Locale.ROOT).replace(' ', '_').equals(path);
@@ -451,7 +558,7 @@ public final class EchestEngine {
         if (screen != null) closeScreen(client.player, screen);
     }
 
-    // ---- main loop -------------------------------------------------------------------------
+    // ---- dispatch --------------------------------------------------------------------------
 
     private static boolean needOwnRead() {
         return localFree < 0 || ownDirty || salesSinceOwnRead >= OWN_REREAD_EVERY;
@@ -462,14 +569,14 @@ public final class EchestEngine {
     }
 
     private static boolean needBalance() {
-        return (sniping || lifting) && (cash < 0 || ticks - lastBalanceTick >= BALANCE_REFRESH_TICKS);
+        return (sniping || lifting || acquiring) && (cash < 0 || ticks - lastBalanceTick >= BALANCE_REFRESH_TICKS);
     }
 
-    /** The single dispatcher after every read, sale or purchase. */
     private static void next(String why) {
         if (needOwnRead()) setState(State.CHECK_OWN, why + "; need your-listings read");
         else if (needMarketRead()) setState(State.CHECK_MARKET, why + "; need market read");
         else if (planBuy()) setState(State.BUY_OPEN, why + "; " + buyReason);
+        else if (!selling) setState(State.WAIT_FULL, why + "; sell side off");
         else if (localFree == 0) enterFull(why);
         else setState(State.PREPARE_SELL, why);
     }
@@ -477,11 +584,13 @@ public final class EchestEngine {
     private static void enterFull(String why) {
         if (state == State.WAIT_FULL) return;
         LocalPlayer p = Minecraft.getInstance().player;
-        if (p != null) {
+        if (p != null && selling) {
             p.sendSystemMessage(Component.literal("[EchestMM] all listing slots are taken; waiting for a sale"));
         }
         setState(State.WAIT_FULL, why);
     }
+
+    // ---- tick ------------------------------------------------------------------------------
 
     private static void tick(Minecraft client) {
         ticks++;
@@ -491,17 +600,18 @@ public final class EchestEngine {
         if (cooldown > 0) { cooldown--; return; }
         InventoryMenu inv = player.inventoryMenu;
         Screen screen = client.gui.screen();
+        long nowMs = System.currentTimeMillis();
 
         switch (state) {
             case CHECK_OWN -> {
                 if (needBalance() && !balanceRequested && readyForCommand(player, inv, screen)) {
+                    if (!sendCommand(client, "bal")) return;
                     balanceRequested = true;
-                    sendCommand(client, "bal");
                     return;
                 }
                 if (!readyForCommand(player, inv, screen)) return;
-                sendCommand(client, "ah");
-                requestMs = System.currentTimeMillis();
+                if (!sendCommand(client, "ah")) return;
+                requestMs = nowMs;
                 setState(State.WAIT_OWN_AH, "sent /ah");
             }
             case WAIT_OWN_AH -> {
@@ -511,8 +621,8 @@ public final class EchestEngine {
                     int top = menu.getItems().size() - MarketFeed.PLAYER_INVENTORY_SLOTS;
                     if (top < 9) { pause(player, "unexpected auction layout (" + top + " top slots)"); return; }
                     int chestSlot = top - 9 + 6;   // last row, 7th slot: "Your Items"
-                    client.gameMode.handleContainerInput(menu.containerId, chestSlot, 0, ContainerInput.PICKUP, player);
-                    requestMs = System.currentTimeMillis();
+                    if (!clickSlot(client, player, menu, chestSlot, 1.0)) return;
+                    requestMs = nowMs;
                     setState(State.WAIT_OWN_SCAN, "clicked Your Items at slot " + chestSlot);
                 } else if (++waited > SCREEN_TIMEOUT_TICKS) {
                     retryOrPause(player, screen, "auction screen did not open");
@@ -523,7 +633,6 @@ public final class EchestEngine {
                 if (own != null && own.observedAtMs() >= requestMs) {
                     applyOwnRead(own);
                     closeScreen(player, screen);
-                    lastCommandTick = ticks;
                     retries = 0;
                     next(localFree + " free, " + ownTotal() + " of ours live");
                 } else if (++waited > SCREEN_TIMEOUT_TICKS) {
@@ -531,17 +640,24 @@ public final class EchestEngine {
                 }
             }
             case CHECK_MARKET -> {
+                // An open, fresh page is free market data; do not spend a command on it.
+                MarketFeed.PageScan open = MarketFeed.latestPage();
+                if (open != null && nowMs - open.observedAtMs() <= PAGE_FRESH_MS && open.page() == 1
+                        && screen instanceof AbstractContainerScreen<?>
+                        && MarketFeed.isAuctionPage(screen.getTitle().getString())) {
+                    if (readMarket(player, open)) { retries = 0; next("reused the open market page"); }
+                    return;
+                }
                 if (!readyForCommand(player, inv, screen)) return;
-                sendCommand(client, "ah " + searchTerm);
-                requestMs = System.currentTimeMillis();
+                if (!sendCommand(client, "ah " + searchTerm)) return;
+                requestMs = nowMs;
                 setState(State.WAIT_MARKET, "sent /ah " + searchTerm);
             }
             case WAIT_MARKET -> {
                 MarketFeed.PageScan page = MarketFeed.latestPage();
                 if (page != null && page.observedAtMs() >= requestMs && page.page() == 1) {
                     boolean ok = readMarket(player, page);
-                    closeScreen(player, screen);
-                    lastCommandTick = ticks;
+                    if (!planBuy()) closeScreen(player, screen);   // keep the page for the buy side
                     if (ok) { retries = 0; next("market read"); }
                 } else if (++waited > SCREEN_TIMEOUT_TICKS) {
                     retryOrPause(player, screen, "market page did not load");
@@ -554,9 +670,21 @@ public final class EchestEngine {
                 }
             }
             case BUY_OPEN -> {
+                MarketFeed.PageScan open = MarketFeed.latestPage();
+                boolean pageUsable = open != null && open.page() == 1
+                        && nowMs - open.observedAtMs() <= PAGE_FRESH_MS
+                        && screen instanceof AbstractContainerScreen<?>
+                        && MarketFeed.isAuctionPage(screen.getTitle().getString());
+                if (pageUsable) {
+                    // The live page keeps updating from inbound packets: no command, no cooldown,
+                    // and prices stay current between clicks.
+                    requestMs = open.observedAtMs();
+                    setState(State.BUY_WAIT_PAGE, "reusing the live page");
+                    return;
+                }
                 if (!readyForCommand(player, inv, screen)) return;
-                sendCommand(client, "ah " + searchTerm);
-                requestMs = System.currentTimeMillis();
+                if (!sendCommand(client, "ah " + searchTerm)) return;
+                requestMs = nowMs;
                 setState(State.BUY_WAIT_PAGE, "sent /ah " + searchTerm + " to buy");
             }
             case BUY_WAIT_PAGE -> {
@@ -569,48 +697,48 @@ public final class EchestEngine {
                 if (!readMarket(player, page)) return;
                 MarketFeed.Listing target = pickBuyTarget(page);
                 if (target == null) {
+                    lastProbeMs = nowMs;
+                    lastProbeFilled = false;
                     closeScreen(player, screen);
-                    lastCommandTick = ticks;
-                    next("nothing cheap enough left on page 1");
+                    next("nothing at or under " + buyMaxPay + " on page 1");
                     return;
                 }
                 buySlot = target.slot();
-                buyExpectedPrice = Math.round(target.totalPrice());
-                client.gameMode.handleContainerInput(container.getMenu().containerId, buySlot, 0,
-                        ContainerInput.PICKUP, player);
-                requestMs = System.currentTimeMillis();
-                setState(State.BUY_CONFIRM, "clicked listing at " + buyExpectedPrice + " (" + buyReason + ")");
+                if (!clickSlot(client, player, container.getMenu(), buySlot, 1.0)) return;
+                requestMs = nowMs;
+                setState(State.BUY_CONFIRM, "clicked " + Math.round(target.totalPrice())
+                        + " (ceiling " + buyMaxPay + ")");
             }
-            case BUY_CLICK -> next("buy click state is unused");
             case BUY_CONFIRM -> {
                 if (screen instanceof DialogScreen<?> dialog) {
                     MarketFeed.QuoteRead quote = MarketFeed.readDialogQuote(client, dialog);
-                    if (!confirmBuyQuote(player, quote)) return;
+                    if (!acceptBuyQuote(player, quote)) return;
                     AbstractButton button = bestPositiveButton(screen.children());
                     if (button == null) {
                         if (++waited > SCREEN_TIMEOUT_TICKS) {
-                            retryOrPause(player, screen, "buy dialog has no Yes-like button: " + buttonLabels(screen.children()));
+                            retryOrPause(player, screen, "buy dialog has no Yes-like button: "
+                                    + buttonLabels(screen.children()));
                         }
                         return;
                     }
+                    if (!ActionPacer.charge(nowMs, 1.0)) return;
                     button.onPress(null);
-                    requestMs = System.currentTimeMillis();
-                    setState(State.BUY_SETTLE, "confirmed buy at or below " + buyMaxPay);
+                    requestMs = nowMs;
+                    setState(State.BUY_SETTLE, "confirmed at or under " + buyMaxPay);
                     return;
                 }
                 if (screen instanceof AbstractContainerScreen<?> container
                         && !MarketFeed.isAuctionPage(screen.getTitle().getString())) {
                     MarketFeed.QuoteRead quote = MarketFeed.readContainerQuote(client, container);
-                    if (!confirmBuyQuote(player, quote)) return;
+                    if (!acceptBuyQuote(player, quote)) return;
                     int slot = confirmSlot(container.getMenu());
                     if (slot < 0) {
                         if (++waited > SCREEN_TIMEOUT_TICKS) retryOrPause(player, screen, "no confirm slot in the buy chest");
                         return;
                     }
-                    client.gameMode.handleContainerInput(container.getMenu().containerId, slot, 0,
-                            ContainerInput.PICKUP, player);
-                    requestMs = System.currentTimeMillis();
-                    setState(State.BUY_SETTLE, "confirmed buy at or below " + buyMaxPay);
+                    if (!clickSlot(client, player, container.getMenu(), slot, 1.0)) return;
+                    requestMs = nowMs;
+                    setState(State.BUY_SETTLE, "confirmed at or under " + buyMaxPay);
                     return;
                 }
                 if (++waited > SCREEN_TIMEOUT_TICKS) {
@@ -618,10 +746,7 @@ public final class EchestEngine {
                 }
             }
             case BUY_SETTLE -> {
-                // A BUY receipt or an ALREADY_BOUGHT message normally moves us on; this is the timeout.
                 if (++waited > SOLD_TIMEOUT_TICKS) {
-                    closeScreen(player, screen);
-                    lastCommandTick = ticks;
                     lastMarketTick = -1;
                     retries = 0;
                     next("buy confirmation timed out");
@@ -638,42 +763,43 @@ public final class EchestEngine {
                     return;
                 }
                 if (!queue.isEmpty()) {
-                    Click c = queue.poll();
+                    Click c = queue.peek();
+                    if (!ActionPacer.charge(nowMs, CLICK_WEIGHT)) return;
+                    queue.poll();
                     client.gameMode.handleContainerInput(inv.containerId, c.slot, c.button, c.input, player);
                     cooldown = CLICK_INTERVAL_TICKS;
                     return;
                 }
-                // Right after a container closes the server is resyncing the inventory; clicks sent
-                // then are dropped or misapplied and strand a stack on the cursor.
                 boolean settled = ticks - lastContainerCloseTick >= CLICK_SETTLE_TICKS;
                 if (!inv.getCarried().isEmpty()) {
                     if (!settled) return;
                     if (!queuePutBack(player, inv, -1)) pause(player, "the cursor is holding an item");
                     return;
                 }
-                int stackSlot = findHotbarStack(inv);
-                if (stackSlot >= 0) {
+                int wrongSlot = findWrongSizedHotbarStack(inv);
+                if (wrongSlot >= 0) {
                     if (!settled) return;
-                    if (!queuePutBack(player, inv, stackSlot)) {
-                        pause(player, "hotbar slot " + (stackSlot - 36 + 1) + " holds a stack of "
-                                + inv.getSlot(stackSlot).getItem().getCount() + "; move it out of the hotbar");
+                    if (!queuePutBack(player, inv, wrongSlot)) {
+                        pause(player, "hotbar slot " + (wrongSlot - 36 + 1) + " holds "
+                                + inv.getSlot(wrongSlot).getItem().getCount() + " but the listing unit is "
+                                + unitSize + "; move it out of the hotbar");
                     }
                     return;
                 }
-                int slot = findHotbarSingle(inv);
-                long gapLeft = commandGapTicks - (ticks - lastCommandTick);
-                if (settled && (slot < 0 || gapLeft >= 3L * CLICK_INTERVAL_TICKS)) {
-                    if (queueRefillOne(player, inv)) return;   // splits one unit off a stack
-                    if (slot < 0) return;                      // stopped or paused inside the refill
+                int slot = findHotbarUnit(inv);
+                if (settled && slot < 0) {
+                    if (queueRefillUnit(player, inv)) return;
+                    return;
                 }
-                if (slot < 0 || gapLeft > 0) return;
+                if (slot < 0) return;
                 Liquidity.Quote quote = quoteNow();
                 lastQuote = quote;
                 if (quote.price() < cfg.minPrice()) {
                     pause(player, "computed price " + quote.price() + " is under the minimum " + cfg.minPrice());
                     return;
                 }
-                currentPrice = quote.price();
+                if (!ActionPacer.charge(nowMs, 0.0)) return;   // no cost; keeps the shape uniform
+                currentPrice = Liquidity.quantize(quote.price(), cfg.tick());
                 currentQueueAhead = quote.queueAhead();
                 sellSlot = slot;
                 int hotbarIndex = slot - 36;
@@ -685,17 +811,19 @@ public final class EchestEngine {
             }
             case SELL_CMD -> {
                 ItemStack held = inv.getSlot(sellSlot).getItem();
-                if (!isSellItem(held) || held.getCount() != 1
+                if (!isDeskItem(held) || held.getCount() != unitSize
                         || player.getInventory().getSelectedSlot() != sellSlot - 36) {
-                    pause(player, "the held slot changed before listing (count=" + held.getCount() + ")");
+                    pause(player, "the held slot changed before listing (count=" + held.getCount()
+                            + ", unit=" + unitSize + ")");
                     return;
                 }
+                if (!readyForCommand(player, inv, null)) return;
                 listReceiptSeen = false;
-                sendCommand(client, "ah sell " + currentPrice);
+                if (!sendCommand(client, "ah sell " + currentPrice)) return;
                 setState(State.WAIT_CONFIRM, "sent /ah sell " + currentPrice);
             }
             case WAIT_CONFIRM -> {
-                if (!isSellItem(inv.getSlot(sellSlot).getItem())) { onListed(player, screen); return; }
+                if (!isDeskItem(inv.getSlot(sellSlot).getItem())) { onListed(player, screen); return; }
                 if (screen != null && pressSellConfirm(client, player, screen)) {
                     setState(State.WAIT_SOLD, "pressed confirm");
                 } else if (++waited > SCREEN_TIMEOUT_TICKS) {
@@ -703,8 +831,10 @@ public final class EchestEngine {
                 }
             }
             case WAIT_SOLD -> {
-                if (!isSellItem(inv.getSlot(sellSlot).getItem())) { onListed(player, screen); return; }
-                if (++waited > SOLD_TIMEOUT_TICKS) retryOrPause(player, screen, "confirmed but the item is still in the hotbar");
+                if (!isDeskItem(inv.getSlot(sellSlot).getItem())) { onListed(player, screen); return; }
+                if (++waited > SOLD_TIMEOUT_TICKS) {
+                    retryOrPause(player, screen, "confirmed but the item is still in the hotbar");
+                }
             }
             default -> { }
         }
@@ -716,19 +846,33 @@ public final class EchestEngine {
             if (++waited % 40 == 0) trace("waiting: a server-side container is still open");
             return false;
         }
-        return ticks - lastCommandTick >= commandGapTicks;
+        return true;
     }
 
-    /** One unit is now live on the market. */
+    /** Charges the pacer and sends; false means the budget said not yet. */
+    private static boolean sendCommand(Minecraft client, String command) {
+        if (!ActionPacer.charge(System.currentTimeMillis(), 1.0)) return false;
+        client.getConnection().sendCommand(command);
+        return true;
+    }
+
+    private static boolean clickSlot(Minecraft client, LocalPlayer player, AbstractContainerMenu menu,
+                                     int slot, double weight) {
+        if (slot < 0) return false;
+        if (!ActionPacer.charge(System.currentTimeMillis(), weight)) return false;
+        client.gameMode.handleContainerInput(menu.containerId, slot, 0, ContainerInput.PICKUP, player);
+        return true;
+    }
+
     private static void onListed(LocalPlayer player, Screen screen) {
+        listed++;
         salesSinceOwnRead++;
         if (localFree > 0) localFree--;
-        if (localFree == 0) localFree = -1;   // reached zero by counting: verify with a read
+        if (localFree == 0) localFree = -1;
         ownPriceCounts.merge(currentPrice, 1, Integer::sum);
         liveListings.add(new LiveListing(currentPrice, System.currentTimeMillis(), currentQueueAhead));
         if (liveListings.size() > 64) liveListings.removeFirst();
         if (screen != null) closeScreen(player, screen);
-        lastCommandTick = ticks;
         retries = 0;
         cursorFixes = 0;
         next("listed at " + currentPrice + (listReceiptSeen ? " (receipt)" : " (item left the hotbar)"));
@@ -744,14 +888,8 @@ public final class EchestEngine {
                 + (screen == null ? "none" : screen.getClass().getSimpleName() + " \"" + screen.getTitle().getString() + "\""));
         if (screen != null) closeScreen(player, screen);
         if (++retries > MAX_RETRIES) { pause(player, why + " (" + MAX_RETRIES + " retries)"); return; }
-        lastCommandTick = ticks;
         invalidateCaches();
         setState(State.CHECK_OWN, "retry " + retries);
-    }
-
-    private static void sendCommand(Minecraft client, String command) {
-        client.getConnection().sendCommand(command);
-        lastCommandTick = ticks;
     }
 
     // ---- market and pricing ----------------------------------------------------------------
@@ -768,15 +906,13 @@ public final class EchestEngine {
         ownDirty = false;
         ownPriceCounts.clear();
         for (MarketFeed.Listing l : own.listings()) {
-            if (itemId.equals(l.itemId()) && l.count() == 1 && Double.isFinite(l.totalPrice())) {
+            if (itemId.equals(l.itemId()) && Double.isFinite(l.totalPrice())) {
                 ownPriceCounts.merge(Math.round(l.totalPrice()), 1, Integer::sum);
             }
         }
-        // Drop live-listing records the server no longer shows, so hold times stay honest.
         liveListings.removeIf(live -> !ownPriceCounts.containsKey(live.price));
     }
 
-    /** Caches page-1 single-unit listing counts by price. Returns false after pausing. */
     private static boolean readMarket(LocalPlayer player, MarketFeed.PageScan page) {
         List<MarketFeed.Listing> all = page.listings();
         if (all.size() >= 4) {
@@ -790,20 +926,19 @@ public final class EchestEngine {
             }
         }
         marketCounts.clear();
-        int singles = 0;
+        int matching = 0;
         for (MarketFeed.Listing l : all) {
-            if (itemId.equals(l.itemId()) && l.count() == 1 && l.totalPrice() > 0) {
+            if (itemId.equals(l.itemId()) && l.count() == unitSize && l.totalPrice() > 0) {
                 marketCounts.merge(Math.round(l.totalPrice()), 1, Integer::sum);
-                singles++;
+                matching++;
             }
         }
         lastMarketTick = ticks;
-        trace("market: " + singles + " single " + itemId + " listings on page 1"
+        trace("market: " + matching + " listings of " + unitSize + "x " + itemId
                 + (marketCounts.isEmpty() ? "" : ", floor " + marketCounts.firstKey()));
         return true;
     }
 
-    /** Competing levels: the visible book minus our own listings at the same price. */
     private static List<Liquidity.Level> competingLevels() {
         List<Liquidity.Level> levels = new ArrayList<>(marketCounts.size());
         for (var e : marketCounts.entrySet()) {
@@ -818,56 +953,87 @@ public final class EchestEngine {
         return Liquidity.quote(competingLevels(), new ArrayList<>(ownPriceCounts.keySet()), clearRate, cfg);
     }
 
+    /** Our own resting ask, which is what a bid has to stay clear of. */
+    private static long askInForce() {
+        if (!ownPriceCounts.isEmpty()) return ownPriceCounts.firstKey();
+        return lastQuote == null ? 0 : lastQuote.price();
+    }
+
     /**
-     * Decides whether the next action is a purchase. Sniping buys anything priced far below our
-     * own quote; lifting buys the whole cheap tail so the floor - and our ask - moves up.
+     * Decides whether the next action is a purchase, and at what ceiling. Three reasons to buy,
+     * strongest ceiling wins: the bid ladder (obsidian), a snipe far under our own quote, and a
+     * floor lift that clears the cheap tail.
      */
     private static boolean planBuy() {
         buyReason = "";
         buyBudgetRemaining = 0;
         lastLift = Liquidity.LiftPlan.no("not evaluated");
-        if (!sniping && !lifting) return false;
-        if (maxBuysPerWindow <= 0 || cash <= 0) return false;
-        if (ticks - buyWindowStart >= BUY_WINDOW_TICKS) { buyWindowStart = ticks; buysInWindow = 0; }
-        if (buysInWindow >= maxBuysPerWindow) return false;
-        if (inventoryRoom(Minecraft.getInstance()) <= 0) return false;
+        if (!sniping && !lifting && !acquiring) return false;
+        if (cash <= 0) return false;
+        if (inventoryRoom(Minecraft.getInstance()) < unitSize) return false;
 
         List<Liquidity.Level> levels = competingLevels();
         if (levels.isEmpty()) return false;
         Liquidity.Quote quote = quoteNow();
         lastQuote = quote;
+        long floor = levels.getFirst().price();
+
+        long ladderAt = 0;
+        if (acquiring) {
+            int held = countInventory(Minecraft.getInstance()) / Math.max(1, unitSize);
+            if (maxHoldUnits > 0 && held >= maxHoldUnits) {
+                lastBid = new Liquidity.BidPlan(false, currentBid,
+                        "holding " + held + " units, at the " + maxHoldUnits + " cap");
+            } else {
+                long nowMs = System.currentTimeMillis();
+                boolean quiet = lastProbeMs > 0 && nowMs - lastProbeMs >= probeSeconds * 1000L;
+                Liquidity.BidPlan plan = Liquidity.ladderBid(currentBid, askInForce(), quiet,
+                        lastProbeFilled, bidStart, bidStep, minSpreadPct, cfg);
+                lastBid = plan;
+                if (plan.buy()) {
+                    if (plan.bid() != currentBid || quiet) {
+                        trace("ladder: " + plan.reason());
+                        lastProbeMs = nowMs;
+                        lastProbeFilled = false;
+                    }
+                    currentBid = plan.bid();
+                    ladderAt = currentBid;
+                }
+            }
+        }
 
         long snipeAt = sniping ? Liquidity.snipeCeiling(quote.price(), cfg) : 0;
         long liftAt = 0;
         if (lifting) {
-            int held = countInventory(Minecraft.getInstance());
+            int held = countInventory(Minecraft.getInstance()) / Math.max(1, unitSize);
             Liquidity.LiftPlan plan = Liquidity.planFloorLift(levels, quote.price(), held,
                     Math.max(0, localFree), cash, cfg);
             lastLift = plan;
             if (plan.go()) liftAt = plan.buyUpTo();
         }
 
-        long ceiling = Math.max(snipeAt, liftAt);
-        if (ceiling <= 0) return false;
-        long floor = levels.getFirst().price();
-        if (floor > ceiling) return false;
+        long ceiling = Math.max(ladderAt, Math.max(snipeAt, liftAt));
+        if (ceiling <= 0 || floor > ceiling) return false;
 
         buyMaxPay = ceiling;
         buyBudgetRemaining = (long) Math.floor(cash * cfg.maxCashSharePct());
-        buyReason = liftAt >= floor && liftAt >= snipeAt
-                ? "lift floor: " + lastLift.reason()
-                : "snipe: floor " + floor + " is under the snipe ceiling " + ceiling + " (quote " + quote.price() + ")";
+        if (buyBudgetRemaining < floor) return false;
+        if (ceiling == ladderAt && ladderAt >= snipeAt && ladderAt >= liftAt) {
+            buyReason = "ladder bid " + ladderAt + " vs floor " + floor + " (ask " + askInForce() + ")";
+        } else if (liftAt >= snipeAt) {
+            buyReason = "lift floor: " + lastLift.reason();
+        } else {
+            buyReason = "snipe under " + snipeAt + " (ask " + quote.price() + ")";
+        }
         return true;
     }
 
-    /** The cheapest listing at or below {@code buyMaxPay} that is not one of ours. */
     private static MarketFeed.Listing pickBuyTarget(MarketFeed.PageScan page) {
         MarketFeed.Listing best = null;
         for (MarketFeed.Listing l : page.listings()) {
-            if (!itemId.equals(l.itemId()) || l.count() != 1) continue;
+            if (!itemId.equals(l.itemId()) || l.count() != unitSize) continue;
             long price = Math.round(l.totalPrice());
-            if (price <= 0 || price > buyMaxPay) continue;
-            if (price > buyBudgetRemaining) continue;
+            if (price <= 0 || price > buyMaxPay || price > buyBudgetRemaining) continue;
             if (isOwnListing(l, price)) continue;
             if (best == null || price < Math.round(best.totalPrice())) best = l;
         }
@@ -877,11 +1043,10 @@ public final class EchestEngine {
     private static boolean isOwnListing(MarketFeed.Listing l, long price) {
         if (!selfName.isBlank() && !l.seller().isBlank()
                 && l.seller().toLowerCase(Locale.ROOT).contains(selfName.toLowerCase(Locale.ROOT))) return true;
-        // Seller metadata is sometimes missing; a price we hold is treated as possibly ours.
         return ownPriceCounts.getOrDefault(price, 0) > 0;
     }
 
-    private static boolean confirmBuyQuote(LocalPlayer player, MarketFeed.QuoteRead quote) {
+    private static boolean acceptBuyQuote(LocalPlayer player, MarketFeed.QuoteRead quote) {
         double price = quote.price();
         if (!(price > 0.0) || !Double.isFinite(price)) {
             if (++waited > SCREEN_TIMEOUT_TICKS) {
@@ -891,20 +1056,18 @@ public final class EchestEngine {
         }
         double tolerance = compactTolerance(quote.evidence(), price);
         if (price > buyMaxPay + tolerance) {
-            trace("refusing the buy: dialog says " + Math.round(price) + " but the ceiling is " + buyMaxPay);
+            trace("refusing: dialog says " + Math.round(price) + ", ceiling is " + buyMaxPay);
             closeAnyScreen();
-            lastCommandTick = ticks;
             lastMarketTick = -1;
             next("buy quote above the ceiling");
             return false;
         }
-        buysInWindow++;
         return true;
     }
 
     // ---- inventory helpers -----------------------------------------------------------------
 
-    private static boolean isSellItem(ItemStack stack) {
+    private static boolean isDeskItem(ItemStack stack) {
         if (stack == null || stack.isEmpty()) return false;
         Identifier id = BuiltInRegistries.ITEM.getKey(stack.getItem());
         return id != null && itemId.equals(id.toString());
@@ -916,12 +1079,11 @@ public final class EchestEngine {
         int n = 0;
         for (int i = MAIN_START; i < HOTBAR_END; i++) {
             ItemStack st = inv.getSlot(i).getItem();
-            if (isSellItem(st)) n += st.getCount();
+            if (isDeskItem(st)) n += st.getCount();
         }
         return n;
     }
 
-    /** Free item slots left for bought stock. */
     private static int inventoryRoom(Minecraft client) {
         if (client.player == null) return 0;
         InventoryMenu inv = client.player.inventoryMenu;
@@ -929,24 +1091,24 @@ public final class EchestEngine {
         for (int i = MAIN_START; i < HOTBAR_END; i++) {
             ItemStack st = inv.getSlot(i).getItem();
             if (st.isEmpty()) room += 64;
-            else if (isSellItem(st)) room += Math.max(0, st.getMaxStackSize() - st.getCount());
+            else if (isDeskItem(st)) room += Math.max(0, st.getMaxStackSize() - st.getCount());
         }
         return room;
     }
 
-    /** A hotbar slot 2-9 holding two or more; selling from one would list the whole stack. */
-    private static int findHotbarStack(InventoryMenu inv) {
+    /** A hotbar slot 2-9 holding the desk item in the wrong quantity for one listing. */
+    private static int findWrongSizedHotbarStack(InventoryMenu inv) {
         for (int s = HOTBAR_START; s < HOTBAR_END; s++) {
             ItemStack st = inv.getSlot(s).getItem();
-            if (isSellItem(st) && st.getCount() > 1) return s;
+            if (isDeskItem(st) && st.getCount() != unitSize) return s;
         }
         return -1;
     }
 
-    private static int findHotbarSingle(InventoryMenu inv) {
+    private static int findHotbarUnit(InventoryMenu inv) {
         for (int s = HOTBAR_START; s < HOTBAR_END; s++) {
             ItemStack st = inv.getSlot(s).getItem();
-            if (isSellItem(st) && st.getCount() == 1) return s;
+            if (isDeskItem(st) && st.getCount() == unitSize) return s;
         }
         return -1;
     }
@@ -970,30 +1132,56 @@ public final class EchestEngine {
     }
 
     /**
-     * Queues the three clicks that split exactly one unit off a stack into a free hotbar slot:
-     * pick the stack up, right-click to drop one, put the remainder back. This is how a stack of
-     * ender chests becomes a sequence of single-unit listings.
+     * Queues the clicks that put exactly one listing unit into a free hotbar slot.
+     *
+     * <p>For a single item that is pick up the stack, right-click one out, put the rest back. For
+     * a full-stack unit the stack moves whole, which is both fewer clicks and the correct listing
+     * shape: {@code /ah sell} lists whatever is held, so a stack desk must hold exactly a stack.
      */
-    private static boolean queueRefillOne(LocalPlayer player, InventoryMenu inv) {
+    private static boolean queueRefillUnit(LocalPlayer player, InventoryMenu inv) {
         int dest = -1;
         for (int s = HOTBAR_START; s < HOTBAR_END; s++) {
             if (inv.getSlot(s).getItem().isEmpty()) { dest = s; break; }
         }
-        int src = -1;
+        int exact = -1;
+        int partial = -1;
+        int oversized = -1;
         for (int i = MAIN_START; i < MAIN_END; i++) {
-            if (isSellItem(inv.getSlot(i).getItem())) { src = i; break; }
+            ItemStack st = inv.getSlot(i).getItem();
+            if (!isDeskItem(st)) continue;
+            int count = st.getCount();
+            if (count == unitSize && exact < 0) exact = i;
+            else if (count > unitSize && oversized < 0) oversized = i;
+            else if (count < unitSize && partial < 0) partial = i;
         }
-        if (dest < 0 || src < 0) {
-            if (findHotbarSingle(inv) < 0) {
-                if (src < 0) stop(player::sendSystemMessage, "no " + itemId + " left in the inventory");
-                else pause(player, "hotbar slots 2-9 are occupied by other items; free one up");
-            }
+        if (dest < 0) {
+            if (findHotbarUnit(inv) < 0) pause(player, "hotbar slots 2-9 are occupied; free one up");
             return false;
         }
-        queue.add(new Click(src, 0, ContainerInput.PICKUP));   // whole stack to the cursor
-        queue.add(new Click(dest, 1, ContainerInput.PICKUP));  // right-click: place exactly one
-        queue.add(new Click(src, 0, ContainerInput.PICKUP));   // remainder back
-        return true;
+        if (exact >= 0) {
+            queue.add(new Click(exact, 0, ContainerInput.PICKUP));
+            queue.add(new Click(dest, 0, ContainerInput.PICKUP));
+            return true;
+        }
+        if (oversized >= 0) {
+            if (unitSize == 1) {
+                queue.add(new Click(oversized, 0, ContainerInput.PICKUP));  // stack to the cursor
+                queue.add(new Click(dest, 1, ContainerInput.PICKUP));       // right-click: place one
+                queue.add(new Click(oversized, 0, ContainerInput.PICKUP));  // remainder back
+                return true;
+            }
+            pause(player, "a slot holds more than one listing unit (" + unitSize + "); split it manually");
+            return false;
+        }
+        if (findHotbarUnit(inv) < 0) {
+            String have = partial >= 0 ? "only partial stacks of " + itemId : "no " + itemId;
+            if (acquiring) {
+                trace(have + " to list; the bid ladder keeps working");
+                return false;
+            }
+            stop(player::sendSystemMessage, have + " left to list");
+        }
+        return false;
     }
 
     // ---- confirmation ----------------------------------------------------------------------
@@ -1012,6 +1200,7 @@ public final class EchestEngine {
                 trace("dialog has no Yes-like button: " + buttonLabels(screen.children()));
                 return false;
             }
+            if (!ActionPacer.charge(System.currentTimeMillis(), 1.0)) return false;
             button.onPress(null);
             return true;
         }
@@ -1020,8 +1209,7 @@ public final class EchestEngine {
             AbstractContainerMenu menu = container.getMenu();
             int slot = confirmSlot(menu);
             if (slot < 0) return false;
-            client.gameMode.handleContainerInput(menu.containerId, slot, 0, ContainerInput.PICKUP, player);
-            return true;
+            return clickSlot(client, player, menu, slot, 1.0);
         }
         return false;
     }
