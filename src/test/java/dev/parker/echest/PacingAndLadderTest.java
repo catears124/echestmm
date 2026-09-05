@@ -49,27 +49,27 @@ final class PacingAndLadderTest {
 
     @Test
     void theLadderStartsLowAndConcedesOnlyWhenNothingFills() {
-        Liquidity.BidPlan first = Liquidity.ladderBid(0, 40_000, false, false,
+        Liquidity.BidPlan first = Liquidity.ladderBid(0, 0, 40_000, false, false,
                 25_000, 500, 0.25, CFG);
         assertTrue(first.buy());
         assertEquals(25_000, first.bid());
 
-        Liquidity.BidPlan held = Liquidity.ladderBid(25_000, 40_000, false, false,
+        Liquidity.BidPlan held = Liquidity.ladderBid(25_000, 0, 40_000, false, false,
                 25_000, 500, 0.25, CFG);
         assertEquals(25_000, held.bid());
 
-        Liquidity.BidPlan conceded = Liquidity.ladderBid(25_000, 40_000, true, false,
+        Liquidity.BidPlan conceded = Liquidity.ladderBid(25_000, 0, 40_000, true, false,
                 25_000, 500, 0.25, CFG);
         assertEquals(25_500, conceded.bid());
     }
 
     @Test
     void aFillWalksTheBidBackDown() {
-        Liquidity.BidPlan afterFill = Liquidity.ladderBid(27_000, 40_000, false, true,
+        Liquidity.BidPlan afterFill = Liquidity.ladderBid(27_000, 0, 40_000, false, true,
                 25_000, 500, 0.25, CFG);
         assertEquals(26_500, afterFill.bid());
         // Never below the configured start.
-        assertEquals(25_000, Liquidity.ladderBid(25_000, 40_000, false, true,
+        assertEquals(25_000, Liquidity.ladderBid(25_000, 0, 40_000, false, true,
                 25_000, 500, 0.25, CFG).bid());
     }
 
@@ -78,14 +78,14 @@ final class PacingAndLadderTest {
         // 40k ask with a 25% spread caps the bid at 30k, however long nothing fills.
         long bid = 25_000;
         for (int i = 0; i < 50; i++) {
-            bid = Liquidity.ladderBid(bid, 40_000, true, false, 25_000, 500, 0.25, CFG).bid();
+            bid = Liquidity.ladderBid(bid, 0, 40_000, true, false, 25_000, 500, 0.25, CFG).bid();
         }
         assertEquals(30_000, bid);
     }
 
     @Test
     void theLadderRefusesWhenTheStartIsAlreadyThroughTheCeiling() {
-        Liquidity.BidPlan plan = Liquidity.ladderBid(0, 30_000, true, false,
+        Liquidity.BidPlan plan = Liquidity.ladderBid(0, 0, 30_000, true, false,
                 25_000, 500, 0.25, CFG);
         assertFalse(plan.buy());
         assertTrue(plan.reason().contains("ceiling"));
@@ -93,12 +93,12 @@ final class PacingAndLadderTest {
 
     @Test
     void theLadderNeedsAnAskToPriceAgainst() {
-        assertFalse(Liquidity.ladderBid(0, 0, true, false, 25_000, 500, 0.25, CFG).buy());
+        assertFalse(Liquidity.ladderBid(0, 0, 0, true, false, 25_000, 500, 0.25, CFG).buy());
     }
 
     @Test
     void ladderBidsSitOnTheTickGrid() {
-        Liquidity.BidPlan plan = Liquidity.ladderBid(25_050, 40_000, true, false,
+        Liquidity.BidPlan plan = Liquidity.ladderBid(25_050, 0, 40_000, true, false,
                 25_000, 550, 0.25, CFG);
         assertEquals(0, plan.bid() % CFG.tick());
     }

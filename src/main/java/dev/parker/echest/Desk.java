@@ -34,13 +34,14 @@ public final class Desk {
     /** Below this many samples the derivation is not trustworthy and the ladder stays off. */
     public static final int MIN_SAMPLES = 20;
 
-    private static final double MIN_SPREAD = 0.08;
+    /** Floor on the profit guard: never bid within this fraction of the resting ask. */
+    private static final double MIN_SPREAD = 0.10;
     private static final double MAX_SPREAD = 0.45;
-
     public record Calibration(
             boolean ladderReady,
             Liquidity.Config cfg,
             long bidStart,
+            long bidCeiling,
             long bidStep,
             double minSpreadPct,
             int maxHoldUnits,
@@ -64,7 +65,7 @@ public final class Desk {
 
         if (n < MIN_SAMPLES) {
             // No invented numbers. Sell into the live book, learn from the fills, calibrate later.
-            return new Calibration(false, base, 0, tick, base.liftMarginPct(), 0, n,
+            return new Calibration(false, base, 0, 0, tick, base.liftMarginPct(), 0, n,
                     "only " + n + " realised trades on record (need " + MIN_SAMPLES + "): "
                             + "bid ladder stays OFF and pricing follows the live book. "
                             + "Run the sell side to gather fills, then /echestmm calibrate.");
@@ -77,10 +78,18 @@ public final class Desk {
         long p90 = Liquidity.quantize(History.quantile(prices, 0.90), tick);
 
         double dispersion = median > 0 ? (p75 - p25) / (double) median : MIN_SPREAD;
-        double spread = Math.max(MIN_SPREAD, Math.min(MAX_SPREAD, dispersion));
+        // The spread guard is a profit requirement, not a volatility measure. Feeding raw
+        // dispersion into it put the bid ceiling 10 dollars above the start on a bimodal book.
+        // What matters is the gap between where we acquire and where the book clears high.
+        double headroom = p90 > 0 ? (p90 - median) / (double) p90 : MIN_SPREAD;
+        double spread = Math.max(MIN_SPREAD, Math.min(MAX_SPREAD, headroom));
 
         long bidStart = Math.max(tick, p10);
-        long step = Math.max(tick, Liquidity.quantize(Math.max(tick, (p25 - p10) / 8), tick));
+        // Acquire below the median and ask near the top decile. Deriving the ceiling from raw
+        // dispersion instead put it 10 dollars above the start on a bimodal book, which is not a
+        // ladder at all; the median is a level the book demonstrably trades through.
+        long ceiling = Math.max(bidStart + tick, median);
+        long step = Math.max(tick, Liquidity.quantize(Math.max(tick, (ceiling - bidStart) / 12), tick));
         long minPrice = Math.max(tick, p25);
         long emptyBookAsk = Math.max(minPrice, p90);
 
@@ -88,8 +97,8 @@ public final class Desk {
         String holdNote;
         if (cash > 0 && median > 0) {
             holdUnits = (int) Math.max(1, Math.floor(cash * base.maxCashSharePct() / median));
-            holdNote = holdUnits + " units (" + Math.round(base.maxCashSharePct() * 100) + "% of $"
-                    + cash + " at the " + median + " median)";
+            holdNote = holdUnits + " listings' worth (" + Math.round(base.maxCashSharePct() * 100)
+                    + "% of $" + cash + " at the " + median + " median)";
         } else {
             holdNote = "uncapped until /bal is known";
         }
@@ -99,12 +108,13 @@ public final class Desk {
                 base.liftMarginPct(), base.maxLiftUnits(), base.maxCashSharePct());
 
         String evidence = String.format(Locale.ROOT,
-                "%d realised trades (%d bought, %d sold): p10 %d, p25 %d, median %d, p75 %d, p90 %d. "
-                        + "bid start %d (p10), step %d ((p25-p10)/8), spread %d%% (IQR/median %.0f%%), "
-                        + "min sell %d (p25), empty-book ask %d (p90), hold %s.",
+                "%d realised trades (%d bought, %d sold), prices per item: p10 %d, p25 %d, median %d, "
+                        + "p75 %d, p90 %d. bid %d (p10) -> %d (median), step %d, spread guard %d%% "
+                        + "(IQR/median %.0f%%), min sell %d (p25), empty-book ask %d (p90), hold %s.",
                 n, samples.bought().size(), samples.sold().size(), p10, p25, median, p75, p90,
-                bidStart, step, Math.round(spread * 100), dispersion * 100, minPrice, emptyBookAsk, holdNote);
+                bidStart, ceiling, step, Math.round(spread * 100), dispersion * 100,
+                minPrice, emptyBookAsk, holdNote);
 
-        return new Calibration(true, cfg, bidStart, step, spread, holdUnits, n, evidence);
+        return new Calibration(true, cfg, bidStart, ceiling, step, spread, holdUnits, n, evidence);
     }
 }

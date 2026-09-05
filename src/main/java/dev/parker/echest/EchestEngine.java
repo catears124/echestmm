@@ -8,6 +8,12 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.KeyMapping;
+import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenEvents;
+import net.fabricmc.fabric.api.client.screen.v1.ScreenKeyboardEvents;
+import net.minecraft.resources.Identifier;
+import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.gui.components.AbstractButton;
 import net.minecraft.client.gui.components.events.ContainerEventHandler;
 import net.minecraft.client.gui.components.events.GuiEventListener;
@@ -149,6 +155,9 @@ public final class EchestEngine {
     private static String buyReason = "";
     private static long buyBudgetRemaining;
 
+    private static final TreeMap<Long, Integer> marketUnits = new TreeMap<>();
+    private static long currentUnitPrice;
+    private static long bidCeiling;
     private static int localFree = -1;
     private static int salesSinceOwnRead;
     private static boolean ownDirty;
@@ -173,11 +182,71 @@ public final class EchestEngine {
 
     private static long disconnectCheckUntilTick;
 
+    /**
+     * Panic switch, default {@code ,} and rebindable under Options / Controls / EchestMM.
+     *
+     * <p>Watched two ways on purpose. A {@link KeyMapping} only fires when no screen is open, and
+     * this engine spends most of its time driving auction screens - which is exactly when you want
+     * to stop it. So the key is also handled on every screen that opens.
+     */
+    private static final KeyMapping.Category PANIC_CATEGORY = KeyMapping.Category.register(
+            Identifier.fromNamespaceAndPath("echestmm", "controls"));
+    private static KeyMapping panicKey;
+
+    private static void registerPanicKey() {
+        panicKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.echestmm.panic",
+                InputConstants.Type.KEYSYM,
+                InputConstants.KEY_COMMA,
+                PANIC_CATEGORY));
+        ScreenEvents.AFTER_INIT.register((client, screen, w, h) ->
+                ScreenKeyboardEvents.afterKeyPress(screen).register((s, event) -> {
+                    if (panicKey != null && panicKey.matches(event)) {
+                        togglePanic(client);
+                    }
+                }));
+    }
+
+    private static void pollPanicKey(Minecraft client) {
+        boolean pressed = false;
+        while (panicKey != null && panicKey.consumeClick()) pressed = true;
+        if (pressed) togglePanic(client);
+    }
+
+    private static void togglePanic(Minecraft client) {
+        if (state == State.OFF || state == State.PAUSED) {
+            start(msg -> {
+                if (client.player != null) client.player.sendSystemMessage(msg);
+            });
+        } else {
+            panicStop(client);
+        }
+    }
+
+    /** Immediate hard stop: no further packets, queued clicks dropped, any screen closed. */
+    private static void panicStop(Minecraft client) {
+        setState(State.OFF, "panic key");
+        queue.clear();
+        containerStuckSinceMs = 0L;
+        containerCloseAttempts = 0;
+        if (client.player != null) {
+            Screen screen = client.gui.screen();
+            if (screen != null) closeScreen(client.player, screen);
+            client.player.sendSystemMessage(Component.literal(
+                    "\u00a7c[EchestMM] PANIC STOP. Listed " + listed + ", sold " + sold + " for $"
+                            + grossSold + ", bought " + bought + " for $" + grossBought + "."));
+        }
+        MarketFeed.log("engine", "panic stop");
+    }
+
     private EchestEngine() {}
 
     static void init() {
+        registerPanicKey();
         ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::tick);
-        // Runs even when the engine is off, so a disconnect can be classified after the fact.
+        // These two run even when the engine is off: the panic key has to be able to switch it on,
+        // and a disconnect has to be classified after the fact.
+        ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::pollPanicKey);
         ClientTickEvents.END_CLIENT_TICK.register(EchestEngine::checkDisconnectCause);
         MarketFeed.onReceipt(EchestEngine::onReceipt);
         MarketFeed.onMessage(EchestEngine::onMessage);
@@ -367,6 +436,7 @@ public final class EchestEngine {
         lastCalibration = cal;
         if (cal.ladderReady()) {
             bidStart = cal.bidStart();
+            bidCeiling = cal.bidCeiling();
             bidStep = cal.bidStep();
             minSpreadPct = cal.minSpreadPct();
             if (cal.maxHoldUnits() > 0) maxHoldUnits = cal.maxHoldUnits();
@@ -411,7 +481,7 @@ public final class EchestEngine {
     private static String status() {
         return "state=" + state + (state == State.PAUSED ? " (" + pauseReason + ")" : "")
                 + " | " + itemId + " x" + unitSize
-                + " | ask=" + (lastQuote == null ? "n/a" : String.valueOf(lastQuote.price()))
+                + " | ask=" + (lastQuote == null ? "n/a" : lastQuote.unitPrice() + "/item")
                 + " | clear=" + (Double.isFinite(clearRate) ? String.format(Locale.ROOT, "%.3f/s", clearRate) : "unmeasured")
                 + " (" + fills.size() + " fills)"
                 + " | free=" + localFree
@@ -560,18 +630,21 @@ public final class EchestEngine {
     private static void onOwnSale(MarketFeed.Receipt r) {
         if (!namesDeskItem(r.itemName())) return;
         if (localFree >= 0) localFree++;
-        long price = Math.round(r.totalPrice());
+        long total = Math.round(r.totalPrice());
+        // Sale lines often omit the quantity, so an unspecified count means one of our listings.
+        int units = r.count() > 0 ? r.count() : unitSize;
+        long unit = unitPriceOf(r.totalPrice(), units);
         sold++;
-        grossSold += price;
-        Integer n = ownPriceCounts.get(price);
+        grossSold += total;
+        Integer n = ownPriceCounts.get(unit);
         if (n != null && n > 0) {
-            if (n == 1) ownPriceCounts.remove(price);
-            else ownPriceCounts.put(price, n - 1);
+            if (n == 1) ownPriceCounts.remove(unit);
+            else ownPriceCounts.put(unit, n - 1);
         } else {
             ownDirty = true;
-            trace("sale at " + price + " was not in the local tally; will re-read your listings");
+            trace("sale at " + unit + "/item was not in the local tally; will re-read your listings");
         }
-        recordFill(price, r.observedAtMs());
+        recordFill(unit, r.observedAtMs());
         if (state == State.WAIT_FULL) next("a sale freed a slot");
     }
 
@@ -860,12 +933,14 @@ public final class EchestEngine {
                 if (slot < 0) return;
                 Liquidity.Quote quote = quoteNow();
                 lastQuote = quote;
-                if (quote.price() < cfg.minPrice()) {
-                    pause(player, "computed price " + quote.price() + " is under the minimum " + cfg.minPrice());
+                if (quote.unitPrice() < cfg.minPrice()) {
+                    pause(player, "computed price " + quote.unitPrice() + "/item is under the minimum "
+                            + cfg.minPrice());
                     return;
                 }
-                if (!ActionPacer.charge(nowMs, 0.0)) return;   // no cost; keeps the shape uniform
-                currentPrice = Liquidity.quantize(quote.price(), cfg.tick());
+                // The quote is per item; the auction house wants the price of the whole listing.
+                currentUnitPrice = quote.unitPrice();
+                currentPrice = Liquidity.quantize(quote.unitPrice() * unitSize, cfg.tick());
                 currentQueueAhead = quote.queueAhead();
                 sellSlot = slot;
                 int hotbarIndex = slot - 36;
@@ -964,8 +1039,8 @@ public final class EchestEngine {
         salesSinceOwnRead++;
         if (localFree > 0) localFree--;
         if (localFree == 0) localFree = -1;
-        ownPriceCounts.merge(currentPrice, 1, Integer::sum);
-        liveListings.add(new LiveListing(currentPrice, System.currentTimeMillis(), currentQueueAhead));
+        ownPriceCounts.merge(currentUnitPrice, 1, Integer::sum);
+        liveListings.add(new LiveListing(currentUnitPrice, System.currentTimeMillis(), currentQueueAhead));
         if (liveListings.size() > 64) liveListings.removeFirst();
         if (screen != null) closeScreen(player, screen);
         retries = 0;
@@ -1002,12 +1077,22 @@ public final class EchestEngine {
         ownPriceCounts.clear();
         for (MarketFeed.Listing l : own.listings()) {
             if (itemId.equals(l.itemId()) && Double.isFinite(l.totalPrice())) {
-                ownPriceCounts.merge(Math.round(l.totalPrice()), 1, Integer::sum);
+                ownPriceCounts.merge(unitPriceOf(l.totalPrice(), l.count()), 1, Integer::sum);
             }
         }
         liveListings.removeIf(live -> !ownPriceCounts.containsKey(live.price));
     }
 
+    /** A listing's price per item, on the grid. Mixed stack sizes are only comparable this way. */
+    private static long unitPriceOf(double totalPrice, int count) {
+        int units = Math.max(1, count);
+        return Liquidity.quantize(Math.round(totalPrice / units), Math.max(1, cfg.tick()));
+    }
+
+    /**
+     * Caches the book as unit prices. Every stack size counts: a 16x listing at 5,000 is cheaper
+     * per item than a 64x at 25,000, and ignoring it is what made the obsidian book read as empty.
+     */
     private static boolean readMarket(LocalPlayer player, MarketFeed.PageScan page) {
         List<MarketFeed.Listing> all = page.listings();
         if (all.size() >= 4) {
@@ -1021,16 +1106,19 @@ public final class EchestEngine {
             }
         }
         marketCounts.clear();
+        marketUnits.clear();
         int matching = 0;
         for (MarketFeed.Listing l : all) {
-            if (itemId.equals(l.itemId()) && l.count() == unitSize && l.totalPrice() > 0) {
-                marketCounts.merge(Math.round(l.totalPrice()), 1, Integer::sum);
-                matching++;
-            }
+            if (!itemId.equals(l.itemId()) || !(l.totalPrice() > 0)) continue;
+            long unit = unitPriceOf(l.totalPrice(), l.count());
+            if (unit <= 0) continue;
+            marketCounts.merge(unit, 1, Integer::sum);
+            marketUnits.merge(unit, Math.max(1, l.count()), Integer::sum);
+            matching++;
         }
         lastMarketTick = ticks;
-        trace("market: " + matching + " listings of " + unitSize + "x " + itemId
-                + (marketCounts.isEmpty() ? "" : ", floor " + marketCounts.firstKey()));
+        trace("market: " + matching + " " + itemId + " listings, any stack size"
+                + (marketCounts.isEmpty() ? "" : ", floor " + marketCounts.firstKey() + "/item"));
         return true;
     }
 
@@ -1039,7 +1127,9 @@ public final class EchestEngine {
         for (var e : marketCounts.entrySet()) {
             int mine = ownPriceCounts.getOrDefault(e.getKey(), 0);
             int others = e.getValue() - mine;
-            if (others > 0) levels.add(new Liquidity.Level(e.getKey(), others));
+            if (others <= 0) continue;
+            int units = marketUnits.getOrDefault(e.getKey(), others);
+            levels.add(new Liquidity.Level(e.getKey(), others, Math.max(others, units)));
         }
         return levels;
     }
@@ -1048,10 +1138,10 @@ public final class EchestEngine {
         return Liquidity.quote(competingLevels(), new ArrayList<>(ownPriceCounts.keySet()), clearRate, cfg);
     }
 
-    /** Our own resting ask, which is what a bid has to stay clear of. */
+    /** Our own resting ask per item, which is what a bid has to stay clear of. */
     private static long askInForce() {
         if (!ownPriceCounts.isEmpty()) return ownPriceCounts.firstKey();
-        return lastQuote == null ? 0 : lastQuote.price();
+        return lastQuote == null ? 0 : lastQuote.unitPrice();
     }
 
     /**
@@ -1065,25 +1155,26 @@ public final class EchestEngine {
         lastLift = Liquidity.LiftPlan.no("not evaluated");
         if (!sniping && !lifting && !acquiring) return false;
         if (cash <= 0) return false;
-        if (inventoryRoom(Minecraft.getInstance()) < unitSize) return false;
+        if (inventoryRoom(Minecraft.getInstance()) <= 0) return false;
 
         List<Liquidity.Level> levels = competingLevels();
         if (levels.isEmpty()) return false;
         Liquidity.Quote quote = quoteNow();
         lastQuote = quote;
-        long floor = levels.getFirst().price();
+        long floor = levels.getFirst().unitPrice();
 
         long ladderAt = 0;
         if (acquiring) {
-            int held = countInventory(Minecraft.getInstance()) / Math.max(1, unitSize);
-            if (maxHoldUnits > 0 && held >= maxHoldUnits) {
+            int heldUnits = countInventory(Minecraft.getInstance());
+            int heldListings = heldUnits / Math.max(1, unitSize);
+            if (maxHoldUnits > 0 && heldListings >= maxHoldUnits) {
                 lastBid = new Liquidity.BidPlan(false, currentBid,
-                        "holding " + held + " units, at the " + maxHoldUnits + " cap");
+                        "holding " + heldListings + " listings' worth, at the " + maxHoldUnits + " cap");
             } else {
                 long nowMs = System.currentTimeMillis();
                 boolean quiet = lastProbeMs > 0 && nowMs - lastProbeMs >= probeSeconds * 1000L;
-                Liquidity.BidPlan plan = Liquidity.ladderBid(currentBid, askInForce(), quiet,
-                        lastProbeFilled, bidStart, bidStep, minSpreadPct, cfg);
+                Liquidity.BidPlan plan = Liquidity.ladderBid(currentBid, bidCeiling, askInForce(),
+                        quiet, lastProbeFilled, bidStart, bidStep, minSpreadPct, cfg);
                 lastBid = plan;
                 if (plan.buy()) {
                     if (plan.bid() != currentBid || quiet) {
@@ -1097,12 +1188,11 @@ public final class EchestEngine {
             }
         }
 
-        long snipeAt = sniping ? Liquidity.snipeCeiling(quote.price(), cfg) : 0;
+        long snipeAt = sniping ? Liquidity.snipeCeiling(quote.unitPrice(), cfg) : 0;
         long liftAt = 0;
         if (lifting) {
-            int held = countInventory(Minecraft.getInstance()) / Math.max(1, unitSize);
-            Liquidity.LiftPlan plan = Liquidity.planFloorLift(levels, quote.price(), held,
-                    Math.max(0, localFree), cash, cfg);
+            Liquidity.LiftPlan plan = Liquidity.planFloorLift(levels, quote.unitPrice(),
+                    countInventory(Minecraft.getInstance()), Math.max(0, localFree), cash, cfg);
             lastLift = plan;
             if (plan.go()) liftAt = plan.buyUpTo();
         }
@@ -1110,35 +1200,47 @@ public final class EchestEngine {
         long ceiling = Math.max(ladderAt, Math.max(snipeAt, liftAt));
         if (ceiling <= 0 || floor > ceiling) return false;
 
-        buyMaxPay = ceiling;
+        buyMaxPay = ceiling;   // unit price
         buyBudgetRemaining = (long) Math.floor(cash * cfg.maxCashSharePct());
         if (buyBudgetRemaining < floor) return false;
         if (ceiling == ladderAt && ladderAt >= snipeAt && ladderAt >= liftAt) {
-            buyReason = "ladder bid " + ladderAt + " vs floor " + floor + " (ask " + askInForce() + ")";
+            buyReason = "ladder bid " + ladderAt + "/item vs floor " + floor + "/item (ask "
+                    + askInForce() + "/item)";
         } else if (liftAt >= snipeAt) {
             buyReason = "lift floor: " + lastLift.reason();
         } else {
-            buyReason = "snipe under " + snipeAt + " (ask " + quote.price() + ")";
+            buyReason = "snipe under " + snipeAt + "/item (ask " + quote.unitPrice() + "/item)";
         }
         return true;
     }
 
+    /**
+     * The best-value listing at or below the bid: cheapest per item, any stack size, affordable in
+     * total. Comparing totals instead of unit prices would prefer a 1x listing over a whole stack.
+     */
     private static MarketFeed.Listing pickBuyTarget(MarketFeed.PageScan page) {
         MarketFeed.Listing best = null;
+        long bestUnit = Long.MAX_VALUE;
         for (MarketFeed.Listing l : page.listings()) {
-            if (!itemId.equals(l.itemId()) || l.count() != unitSize) continue;
-            long price = Math.round(l.totalPrice());
-            if (price <= 0 || price > buyMaxPay || price > buyBudgetRemaining) continue;
-            if (isOwnListing(l, price)) continue;
-            if (best == null || price < Math.round(best.totalPrice())) best = l;
+            if (!itemId.equals(l.itemId())) continue;
+            long total = Math.round(l.totalPrice());
+            if (total <= 0 || total > buyBudgetRemaining) continue;
+            long unit = unitPriceOf(l.totalPrice(), l.count());
+            if (unit <= 0 || unit > buyMaxPay) continue;
+            if (Math.max(1, l.count()) > inventoryRoom(Minecraft.getInstance())) continue;
+            if (isOwnListing(l, unit)) continue;
+            if (unit < bestUnit) {
+                bestUnit = unit;
+                best = l;
+            }
         }
         return best;
     }
 
-    private static boolean isOwnListing(MarketFeed.Listing l, long price) {
+    private static boolean isOwnListing(MarketFeed.Listing l, long unitPrice) {
         if (!selfName.isBlank() && !l.seller().isBlank()
                 && l.seller().toLowerCase(Locale.ROOT).contains(selfName.toLowerCase(Locale.ROOT))) return true;
-        return ownPriceCounts.getOrDefault(price, 0) > 0;
+        return ownPriceCounts.getOrDefault(unitPrice, 0) > 0;
     }
 
     private static boolean acceptBuyQuote(LocalPlayer player, MarketFeed.QuoteRead quote) {
@@ -1271,7 +1373,10 @@ public final class EchestEngine {
         if (findHotbarUnit(inv) < 0) {
             String have = partial >= 0 ? "only partial stacks of " + itemId : "no " + itemId;
             if (acquiring) {
-                trace(have + " to list; the bid ladder keeps working");
+                // Nothing to list, but the buy side still has work. Leaving PREPARE_SELL matters:
+                // returning false from here re-entered the state every tick and traced 16 times a
+                // second for as long as the desk had no stock.
+                setState(State.WAIT_FULL, have + " to list; the bid ladder keeps working");
                 return false;
             }
             stop(player::sendSystemMessage, have + " left to list");

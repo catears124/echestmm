@@ -155,8 +155,8 @@ final class DeskCalibrationTest {
         long ask = cal.cfg().fallbackPrice();
         long bid = cal.bidStart();
         for (int i = 0; i < 100; i++) {
-            bid = Liquidity.ladderBid(bid, ask, true, false, cal.bidStart(), cal.bidStep(),
-                    cal.minSpreadPct(), cal.cfg()).bid();
+            bid = Liquidity.ladderBid(bid, cal.bidCeiling(), ask, true, false, cal.bidStart(),
+                    cal.bidStep(), cal.minSpreadPct(), cal.cfg()).bid();
         }
         assertTrue(bid < ask, "ladder ceiling " + bid + " must stay under the ask " + ask);
         assertTrue(bid <= Math.floor(ask * (1.0 - cal.minSpreadPct())) + 100);
