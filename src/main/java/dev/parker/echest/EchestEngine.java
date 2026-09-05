@@ -191,6 +191,20 @@ public final class EchestEngine {
     private static boolean squeezing = false;
 
     private static final TreeMap<Long, Integer> marketUnits = new TreeMap<>();
+    /**
+     * Every visible lot at its per-item price, whatever its size.
+     *
+     * <p>Kept separately from {@link #marketCounts} because the two sides of the desk compare
+     * different things: acquisition wants the cheapest item anywhere in the book, while listing
+     * may only be compared against lots the size of ours.
+     */
+    private static final TreeMap<Long, Integer> marketAnyLot = new TreeMap<>();
+    private static int lastComparableLots;
+    /** Pages folded into the current book read. */
+    private static int marketPagesRead;
+    /** How deep to page looking for lots our own size. */
+    private static final int MAX_MARKET_PAGES = 6;
+    private static int lastAnyLots;
     private static long currentUnitPrice;
     private static long bidCeiling;
     private static int localFree = -1;
@@ -715,6 +729,10 @@ public final class EchestEngine {
         ownPriceCounts.clear();
         liveListings.clear();
         marketUnits.clear();
+        marketAnyLot.clear();
+        marketPagesRead = 0;
+        lastComparableLots = 0;
+        lastAnyLots = 0;
         listed = 0;
         sold = 0;
         grossSold = 0;
@@ -1038,6 +1056,7 @@ public final class EchestEngine {
                 }
             }
             case CHECK_MARKET -> {
+                marketPagesRead = 0;   // a new scan assembles a new book
                 // An open search page is free market data. It has to be a *search* page, though:
                 // the /ah main menu is also titled "Auction House | Page 1", and reusing it read
                 // the book as empty, which silently disabled every price decision downstream.
@@ -1053,8 +1072,25 @@ public final class EchestEngine {
             }
             case WAIT_MARKET -> {
                 MarketFeed.PageScan page = MarketFeed.latestPage();
-                if (page != null && page.observedAtMs() >= requestMs && page.page() == 1) {
+                if (page != null && page.observedAtMs() >= requestMs
+                        && page.page() >= marketPagesRead + 1) {
                     boolean ok = readMarket(player, page);
+                    marketPagesRead++;
+                    // Donut sorts the search page by listing total, so a stack desk's real
+                    // competition is never on page 1: it is a wall of 1x lots there. Keep paging
+                    // until lots of our own size appear, or we run out of patience.
+                    if (ok && lastComparableLots == 0 && unitSize > 1
+                            && marketPagesRead < MAX_MARKET_PAGES
+                            && screen instanceof AbstractContainerScreen<?> container) {
+                        int nextSlot = findNextPageSlot(client, container);
+                        if (nextSlot >= 0 && clickSlot(client, player, container.getMenu(), nextSlot, 1.0)) {
+                            requestMs = nowMs;
+                            waited = 0;
+                            trace("page " + marketPagesRead + " had no " + unitSize
+                                    + "x lots; paging deeper for comparable stacks");
+                            return;
+                        }
+                    }
                     if (!planBuy()) closeScreen(player, screen);   // keep the page for the buy side
                     if (ok) { retries = 0; next("market read"); }
                 } else if (++waited > SCREEN_TIMEOUT_TICKS) {
@@ -1204,6 +1240,14 @@ public final class EchestEngine {
                 if (slot < 0) return;
                 Liquidity.Quote quote = quoteNow();
                 lastQuote = quote;
+                if (quote.unitPrice() <= 0) {
+                    // No comparable price exists yet. Not a fault and not a reason to pause the
+                    // desk: the buy side still has work, and the next market read may page deeper.
+                    trace("not listing: " + quote.reason());
+                    cooldown = 60;
+                    setState(State.WAIT_FULL, "no comparable price; buy side continues");
+                    return;
+                }
                 if (quote.unitPrice() < cfg.minPrice()) {
                     pause(player, "computed price " + quote.unitPrice() + "/item is under the minimum "
                             + cfg.minPrice());
@@ -1401,21 +1445,78 @@ public final class EchestEngine {
                 return false;
             }
         }
-        marketCounts.clear();
-        marketUnits.clear();
-        int matching = 0;
+        // Page 1 starts a fresh book; deeper pages add to it, because the whole point of paging
+        // is to assemble one book out of several screens.
+        if (marketPagesRead == 0) {
+            marketCounts.clear();
+            marketUnits.clear();
+            marketAnyLot.clear();
+            lastComparableLots = 0;
+            lastAnyLots = 0;
+        }
+        int matching = lastAnyLots;
+        int comparable = lastComparableLots;
         for (MarketFeed.Listing l : all) {
             if (!itemId.equals(l.itemId()) || !(l.totalPrice() > 0)) continue;
             long unit = unitPriceOf(l.totalPrice(), l.count());
             if (unit <= 0) continue;
+            matching++;
+            // Every lot, at its per-item price: this is what acquisition compares, because a
+            // cheap 17-item lot is cheap supply regardless of how we intend to resell it.
+            marketAnyLot.merge(unit, Math.max(1, l.count()), Integer::sum);
+            // The sell side may only compare lots of our own size.
+            //
+            // Donut's search page sorts by *listing total*, so page 1 of "obsidian" is a wall of
+            // 1x and 8x lots. Those price at 2,000/item while real 64x stacks trade at 469/item -
+            // a 4x error that made this desk list stacks at $121,600 while quickbuy sat at
+            // $30,000. Small lots are not our competition; a buyer of a stack does not buy 64
+            // single blocks.
+            if (Math.max(1, l.count()) != Math.max(1, unitSize)) continue;
             marketCounts.merge(unit, 1, Integer::sum);
             marketUnits.merge(unit, Math.max(1, l.count()), Integer::sum);
-            matching++;
+            comparable++;
         }
+        lastComparableLots = comparable;
+        lastAnyLots = matching;
         lastMarketTick = ticks;
         trace("market: " + matching + " " + itemId + " listings, any stack size"
                 + (marketCounts.isEmpty() ? "" : ", floor " + marketCounts.firstKey() + "/item"));
         return true;
+    }
+
+    /**
+     * The "next page" control, found by name.
+     *
+     * <p>Located by its tooltip rather than a hardcoded index, the same way the order screens are
+     * read: a guessed slot number was wrong twice already, and a name is evidence the server
+     * actually sends.
+     */
+    private static int findNextPageSlot(Minecraft client, AbstractContainerScreen<?> screen) {
+        AbstractContainerMenu menu = screen.getMenu();
+        List<ItemStack> stacks = menu.getItems();
+        int top = Math.max(0, stacks.size() - MarketFeed.PLAYER_INVENTORY_SLOTS);
+        for (int i = 0; i < top; i++) {
+            ItemStack stack = stacks.get(i);
+            if (stack == null || stack.isEmpty()) continue;
+            String name = stack.getDisplayName().getString().toLowerCase(Locale.ROOT);
+            String tip = MarketFeed.joinLines(MarketFeed.tooltipLines(client, stack), " ")
+                    .toLowerCase(Locale.ROOT);
+            if (name.contains("next") || tip.contains("next page")) return i;
+        }
+        MarketFeed.dumpOpenScreen(client, msg -> {});
+        trace("no next-page control found on the auction page; dumped it to screen_dumps.txt");
+        return -1;
+    }
+
+    /** Every lot in the book by per-item price: the supply acquisition can actually buy. */
+    private static List<Liquidity.Level> supplyLevels() {
+        List<Liquidity.Level> levels = new ArrayList<>(marketAnyLot.size());
+        for (var e : marketAnyLot.entrySet()) {
+            int units = Math.max(1, e.getValue());
+            int listings = Math.max(1, units / Math.max(1, unitSize));
+            levels.add(new Liquidity.Level(e.getKey(), listings, units));
+        }
+        return levels;
     }
 
     private static List<Liquidity.Level> competingLevels() {
@@ -1444,6 +1545,15 @@ public final class EchestEngine {
                     Liquidity.queueAhead(levels, new ArrayList<>(ownPriceCounts.keySet()),
                             squeeze.askUnitPrice()),
                     Double.NaN, Double.NaN, "squeeze: " + squeeze.reason());
+        }
+        if (levels.isEmpty() && lastAnyLots > 0 && unitSize > 1) {
+            // The page is full of this item, just not in our lot size. That is not an empty book
+            // and must not trigger upward discovery: Donut sorts by listing total, so the stacks
+            // we compete with are pages deeper. Saying so beats inventing a price.
+            return new Liquidity.Quote(0, 0, Double.NaN, Double.NaN,
+                    "no " + unitSize + "x lots visible among " + lastAnyLots
+                            + " listings: the page sorts by listing total, so stacks sit deeper. "
+                            + "Refusing to price a stack against 1x lots.");
         }
         if (levels.isEmpty()) {
             long opening = Math.max(cfg.minPrice(), cfg.fallbackPrice());
@@ -1611,7 +1721,9 @@ public final class EchestEngine {
         if (cash <= 0) return false;
         if (inventoryRoom(Minecraft.getInstance()) <= 0) return false;
 
-        List<Liquidity.Level> levels = competingLevels();
+        // Acquisition prices against every lot in the book, not only stack-sized ones: a cheap
+        // 17-item listing is cheap obsidian, and orders and quickbuys both take it happily.
+        List<Liquidity.Level> levels = supplyLevels();
         if (levels.isEmpty()) return false;
         Liquidity.Quote quote = quoteNow();
         lastQuote = quote;
